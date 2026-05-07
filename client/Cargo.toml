@@ -1,0 +1,17 @@
+[package]
+name = "matter_scanner"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+mdns-sd = "0.13"
+matc = "0.1"
+tokio = { version = "1", features = ["rt"] }
+
+[[bin]]
+name = "main_list"
+path = "src/main_list.rs"
+
+[[bin]]
+name = "main_connect"
+path = "src/main_connect.rs"

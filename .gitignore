@@ -1,0 +1,5 @@
+.idea
+bridge/target
+client/target
+bridge/.matter_kvs
+.matter_kvs
