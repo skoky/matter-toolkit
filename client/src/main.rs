@@ -9,6 +9,7 @@ mod utils;
 
 use anyhow::Result;
 use app::App;
+use env_logger;
 use app::STATE_PATH;
 use crossterm::{
     event::{self, Event},
@@ -25,6 +26,11 @@ use ui::draw;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let log_file = std::fs::File::create("client-debug.log")?;
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("matc=debug"))
+        .target(env_logger::Target::Pipe(Box::new(log_file)))
+        .init();
+
     let state = state::AppState::load(STATE_PATH)?;
     matter::ensure_credentials(&state)?;
 

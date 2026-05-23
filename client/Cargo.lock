@@ -719,8 +719,6 @@ dependencies = [
 [[package]]
 name = "matc"
 version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ae57f1e3c4d8cd4d817bfc9f5d5fb2efe77e5c3123e9817c8cc34092824d4562"
 dependencies = [
  "aes",
  "anyhow",
@@ -755,7 +753,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "crossterm",
+ "env_logger",
  "flume",
+ "log",
  "matc",
  "mdns-sd",
  "ratatui",
