@@ -24,6 +24,25 @@ The bridge code uses Tokio to start multiple tasks once activated. The original 
 * Once the bridge is commissioned and restarted, the first command fails with an unknown session error. The second and subsequent commands seem to work correctly.
 * Some errors appear in the log indicating that certain features are not yet implemented. This is likely due to incomplete implementations that do not fully follow the Matter specification.
 
-# Client Example
+# Client Examples
 
-This is an example of how to use `matc`, a separate and excellent implementation of a Matter controller/client. For now, it only listens for commissionable devices on the network. Once found, it lists all the details of the device, including IDs and default suggested names that will appear in Alexa or Siri when commissioning the bridge device.
+The `client` crate uses `matc`, a separate Matter controller/client implementation. It currently builds two client binaries:
+
+* `clientui`: an interactive terminal UI for scanning, commissioning, naming endpoints, managing commissioned devices, and invoking endpoint commands.
+* `invoker`: a small command-line client for invoking one command on a saved device endpoint.
+
+Both clients use the same local state file, `client/client-state.toml`. The terminal UI writes this file when devices are commissioned or endpoint aliases are renamed. The invoker reads it to resolve a device name and endpoint name to the saved node ID, address, and endpoint ID.
+
+Run the terminal UI from the `client` directory:
+
+```sh
+cargo run --bin clientui
+```
+
+In the terminal UI, use `r` to scan, `c` to commission a selected commissionable device, and `m` or Enter to manage a saved commissioned device. The manage screen supports On/Off endpoints, Actions-cluster entries, endpoint alias changes, fabric label updates, and decommissioning.
+
+Run the invoker from the `client` directory:
+
+```sh
+cargo run --bin invoker -- "<device name>" "<endpoint name>" "<action>"
+```

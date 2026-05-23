@@ -3,3 +3,7 @@ bridge/target
 client/target
 bridge/.matter_kvs
 .matter_kvs
+/client/pem/
+/client/*.log
+/client/client-state.toml
+
