@@ -1,4 +1,11 @@
 use anyhow::{anyhow, Context, Result};
+use crossterm::{
+    event::{self, Event, KeyCode, KeyEvent, KeyEventKind},
+    execute,
+    terminal::{
+        disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    },
+};
 use flume::RecvTimeoutError;
 use matc::{
     certmanager::{self, CertManager, FileCertManager},
@@ -6,10 +13,14 @@ use matc::{
     controller, transport,
 };
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
+use ratatui::{
+    prelude::*,
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
+};
 use std::{
     collections::BTreeMap,
     fs,
-    io::{self, Write},
+    io::{self, Stdout},
     net::IpAddr,
     path::Path,
     sync::Arc,
@@ -71,6 +82,120 @@ struct EndpointSummary {
     device_types: Vec<String>,
     has_on_off: bool,
     actions: Vec<codec::actions_cluster::Action>,
+}
+
+struct ManageState {
+    device: KnownDevice,
+    connection: controller::Connection,
+    endpoints: Vec<EndpointSummary>,
+    selected_endpoint: usize,
+}
+
+struct PendingCommission {
+    connection: controller::Connection,
+    node_id: u64,
+    address: String,
+    device_label: String,
+    fabric_label: String,
+    endpoints: Vec<EndpointSummary>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FocusPane {
+    Commissionable,
+    Commissioned,
+}
+
+enum Screen {
+    Overview,
+    Manage(ManageState),
+}
+
+enum Modal {
+    Input(InputDialog),
+    Message(String),
+    Confirm(ConfirmDialog),
+    Action(ActionDialog),
+    CommissionDeviceName {
+        pending: PendingCommission,
+        value: String,
+    },
+    CommissionFabricName {
+        pending: PendingCommission,
+        value: String,
+    },
+    CommissionEndpointName {
+        pending: PendingCommission,
+        index: usize,
+        value: String,
+    },
+}
+
+struct InputDialog {
+    title: String,
+    value: String,
+    help: String,
+    submit: SubmitAction,
+}
+
+struct ConfirmDialog {
+    title: String,
+    message: String,
+    confirm: ConfirmAction,
+}
+
+struct ActionDialog {
+    title: String,
+    endpoint_index: usize,
+    options: Vec<ActionOption>,
+    selected: usize,
+}
+
+struct ActionOption {
+    label: String,
+    command_id: u32,
+    payload: Vec<u8>,
+}
+
+enum SubmitAction {
+    CommissionSetupCode { device_index: usize },
+    RenameEndpoint { endpoint_index: usize },
+    ChangeFabricLabel,
+}
+
+enum ConfirmAction {
+    Decommission,
+}
+
+struct App {
+    state: AppState,
+    screen: Screen,
+    focus: FocusPane,
+    commissionable: Vec<CommissionableDevice>,
+    commissioned: Vec<CommissionedDevice>,
+    selected_commissionable: usize,
+    selected_commissioned: usize,
+    modal: Option<Modal>,
+    pending_task: Option<PendingTask>,
+    status: String,
+    quit: bool,
+}
+
+enum PendingTask {
+    RefreshScan,
+    StartCommission { device_index: usize, setup_code: String },
+    OpenSelectedCommissioned,
+    EndpointOn { endpoint_index: usize },
+    EndpointOff { endpoint_index: usize },
+    ChangeFabricLabel { label: String },
+    InvokeAction {
+        endpoint_index: usize,
+        command_id: u32,
+        payload: Vec<u8>,
+        label: String,
+    },
+    Decommission,
+    FinishCommission(PendingCommission),
 }
 
 impl Default for AppState {
@@ -161,142 +286,1136 @@ impl AppState {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let mut state = AppState::load(STATE_PATH)?;
-    ensure_credentials(&state)?;
+impl App {
+    fn new(state: AppState) -> Self {
+        Self {
+            state,
+            screen: Screen::Overview,
+            focus: FocusPane::Commissionable,
+            commissionable: Vec::new(),
+            commissioned: Vec::new(),
+            selected_commissionable: 0,
+            selected_commissioned: 0,
+            modal: None,
+            pending_task: None,
+            status: "Startup: r scan | c commission selected commissionable device | m manage selected commissioned device | q quit".to_string(),
+            quit: false,
+        }
+    }
 
-    loop {
-        let (commissionable, commissioned) = scan_network(&state)?;
-        print_overview(&state, &commissionable, &commissioned);
-
-        match prompt("Select: [r]efresh, [c]ommission, [m]anage, [q]uit")?.as_str() {
-            "q" | "quit" => break,
-            "r" | "refresh" => continue,
-            "c" | "commission" => {
-                if let Err(err) = commission_flow(&mut state, &commissionable).await {
-                    println!("Commissioning failed: {err:#}");
-                    wait_for_enter()?;
-                }
+    async fn refresh_scan(&mut self) {
+        self.status = "Scanning LAN for Matter devices...".to_string();
+        match scan_network(&self.state) {
+            Ok((commissionable, commissioned)) => {
+                self.commissionable = commissionable;
+                self.commissioned = commissioned;
+                self.selected_commissionable =
+                    clamp_selection(self.selected_commissionable, self.commissionable.len());
+                self.selected_commissioned =
+                    clamp_selection(self.selected_commissioned, self.commissioned.len());
+                self.status = format!(
+                    "Found {} commissionable and {} commissioned devices.",
+                    self.commissionable.len(),
+                    self.commissioned.len()
+                );
             }
-            "m" | "manage" => {
-                if let Err(err) = manage_flow(&mut state, &commissioned).await {
-                    println!("Device operation failed: {err:#}");
-                    wait_for_enter()?;
-                }
-            }
-            _ => {
-                println!("Unknown command.");
-                wait_for_enter()?;
+            Err(err) => {
+                self.status = format!("Scan failed: {err}");
             }
         }
     }
 
-    Ok(())
-}
+    async fn on_key(&mut self, key: KeyEvent) -> Result<()> {
+        if key.kind != KeyEventKind::Press {
+            return Ok(());
+        }
 
-fn print_overview(
-    state: &AppState,
-    commissionable: &[CommissionableDevice],
-    commissioned: &[CommissionedDevice],
-) {
-    clear_screen();
-    println!("Matter terminal client");
-    println!("Controller ID: {}", state.controller_id);
-    println!("Fabric Label: {}", state.fabric_label);
-    println!();
+        if self.modal.is_some() {
+            return self.on_modal_key(key).await;
+        }
 
-    println!("Commissionable devices");
-    if commissionable.is_empty() {
-        println!("  none found");
-    } else {
-        for (idx, device) in commissionable.iter().enumerate() {
-            println!(
-                "  [{}] {} | type: {} | addr: {}",
-                idx + 1,
-                device.display_name,
-                device.device_type,
-                first_socket_addr(&device.addresses, device.port)
-            );
-            if device.discriminator.is_some()
-                || device.vendor_id.is_some()
-                || device.product_id.is_some()
-            {
-                println!(
-                    "      discriminator={:?} vendor={:?} product={:?}",
-                    device.discriminator, device.vendor_id, device.product_id
+        match &self.screen {
+            Screen::Overview => self.on_overview_key(key).await,
+            Screen::Manage(_) => self.on_manage_key(key).await,
+        }
+    }
+
+    async fn on_overview_key(&mut self, key: KeyEvent) -> Result<()> {
+        match key.code {
+            KeyCode::Char('q') => self.quit = true,
+            KeyCode::Char('r') => {
+                self.queue_task(PendingTask::RefreshScan, "Scanning LAN for Matter devices...");
+            }
+            KeyCode::Tab | KeyCode::Left | KeyCode::Right => {
+                self.focus = match self.focus {
+                    FocusPane::Commissionable => FocusPane::Commissioned,
+                    FocusPane::Commissioned => FocusPane::Commissionable,
+                };
+            }
+            KeyCode::Up => match self.focus {
+                FocusPane::Commissionable => {
+                    self.selected_commissionable = self.selected_commissionable.saturating_sub(1);
+                }
+                FocusPane::Commissioned => {
+                    self.selected_commissioned = self.selected_commissioned.saturating_sub(1);
+                }
+            },
+            KeyCode::Down => match self.focus {
+                FocusPane::Commissionable => {
+                    self.selected_commissionable =
+                        next_index(self.selected_commissionable, self.commissionable.len());
+                }
+                FocusPane::Commissioned => {
+                    self.selected_commissioned =
+                        next_index(self.selected_commissioned, self.commissioned.len());
+                }
+            },
+            KeyCode::Char('c') => {
+                if self.focus == FocusPane::Commissionable && !self.commissionable.is_empty() {
+                    self.modal = Some(Modal::Input(InputDialog {
+                        title: "Commission Device".to_string(),
+                        value: String::new(),
+                        help: "Matter setup code: 8-digit passcode, manual code, or MT: QR payload"
+                            .to_string(),
+                        submit: SubmitAction::CommissionSetupCode {
+                            device_index: self.selected_commissionable,
+                        },
+                    }));
+                }
+            }
+            KeyCode::Char('m') | KeyCode::Enter => {
+                if self.focus == FocusPane::Commissioned {
+                    self.queue_task(
+                        PendingTask::OpenSelectedCommissioned,
+                        "Connecting to commissioned device...",
+                    );
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    async fn on_manage_key(&mut self, key: KeyEvent) -> Result<()> {
+        let Screen::Manage(manage) = &mut self.screen else {
+            return Ok(());
+        };
+
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('b') => {
+                self.screen = Screen::Overview;
+                self.status = "Returned to device overview.".to_string();
+            }
+            KeyCode::Up => {
+                manage.selected_endpoint = manage.selected_endpoint.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                manage.selected_endpoint =
+                    next_index(manage.selected_endpoint, manage.endpoints.len());
+            }
+            KeyCode::Char('o') => {
+                let selected_endpoint = manage.selected_endpoint;
+                if let Some(endpoint) = manage.endpoints.get(selected_endpoint) {
+                    if endpoint.has_on_off {
+                        let endpoint_id = endpoint.id;
+                        self.queue_task(
+                            PendingTask::EndpointOn {
+                                endpoint_index: selected_endpoint,
+                            },
+                            &format!("Sending On to endpoint {}...", endpoint_id),
+                        );
+                    }
+                }
+            }
+            KeyCode::Char('f') => {
+                self.modal = Some(Modal::Input(InputDialog {
+                    title: "Fabric Name".to_string(),
+                    value: self.state.fabric_label.clone(),
+                    help: "Update the fabric label stored on this device".to_string(),
+                    submit: SubmitAction::ChangeFabricLabel,
+                }));
+            }
+            KeyCode::Char('p') => {
+                let selected_endpoint = manage.selected_endpoint;
+                if let Some(endpoint) = manage.endpoints.get(selected_endpoint) {
+                    if endpoint.has_on_off {
+                        let endpoint_id = endpoint.id;
+                        self.queue_task(
+                            PendingTask::EndpointOff {
+                                endpoint_index: selected_endpoint,
+                            },
+                            &format!("Sending Off to endpoint {}...", endpoint_id),
+                        );
+                    }
+                }
+            }
+            KeyCode::Char('n') => {
+                if let Some(endpoint) = manage.endpoints.get(manage.selected_endpoint) {
+                    let default = endpoint
+                        .label
+                        .clone()
+                        .unwrap_or_else(|| format_device_types(&endpoint.device_types));
+                    self.modal = Some(Modal::Input(InputDialog {
+                        title: format!("Rename Endpoint {}", endpoint.id),
+                        value: default,
+                        help: "Local alias stored by this client".to_string(),
+                        submit: SubmitAction::RenameEndpoint {
+                            endpoint_index: manage.selected_endpoint,
+                        },
+                    }));
+                }
+            }
+            KeyCode::Char('a') => {
+                if let Some(endpoint) = manage.endpoints.get(manage.selected_endpoint) {
+                    if !endpoint.actions.is_empty() {
+                        self.modal = Some(Modal::Action(build_action_dialog(
+                            endpoint,
+                            manage.selected_endpoint,
+                        )?));
+                    } else {
+                        self.status = format!(
+                            "Endpoint {} does not expose Actions cluster entries.",
+                            endpoint.id
+                        );
+                    }
+                }
+            }
+            KeyCode::Char('d') => {
+                self.modal = Some(Modal::Confirm(ConfirmDialog {
+                    title: "Decommission Device".to_string(),
+                    message: "Remove this fabric from the selected device? [y/n]".to_string(),
+                    confirm: ConfirmAction::Decommission,
+                }));
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    async fn on_modal_key(&mut self, key: KeyEvent) -> Result<()> {
+        match self.modal.take().context("modal missing")? {
+            Modal::Message(message) => {
+                if matches!(key.code, KeyCode::Enter | KeyCode::Esc) {
+                    self.status = message;
+                    self.modal = None;
+                } else {
+                    self.modal = Some(Modal::Message(message));
+                }
+            }
+            Modal::Confirm(dialog) => match key.code {
+                KeyCode::Char('y') => self.run_confirm(dialog.confirm).await?,
+                KeyCode::Char('n') | KeyCode::Esc => {
+                    self.status = "Canceled.".to_string();
+                }
+                _ => self.modal = Some(Modal::Confirm(dialog)),
+            },
+            Modal::Input(mut dialog) => match key.code {
+                KeyCode::Esc => {
+                    self.status = "Canceled.".to_string();
+                }
+                KeyCode::Enter => self.run_input_submit(dialog).await?,
+                KeyCode::Backspace => {
+                    dialog.value.pop();
+                    self.modal = Some(Modal::Input(dialog));
+                }
+                KeyCode::Char(ch) => {
+                    dialog.value.push(ch);
+                    self.modal = Some(Modal::Input(dialog));
+                }
+                _ => self.modal = Some(Modal::Input(dialog)),
+            },
+            Modal::Action(mut dialog) => match key.code {
+                KeyCode::Esc => {
+                    self.status = "Canceled.".to_string();
+                }
+                KeyCode::Up => {
+                    dialog.selected = dialog.selected.saturating_sub(1);
+                    self.modal = Some(Modal::Action(dialog));
+                }
+                KeyCode::Down => {
+                    dialog.selected = next_index(dialog.selected, dialog.options.len());
+                    self.modal = Some(Modal::Action(dialog));
+                }
+                KeyCode::Enter => self.run_action_submit(dialog).await?,
+                _ => self.modal = Some(Modal::Action(dialog)),
+            },
+            Modal::CommissionDeviceName { pending, mut value } => match key.code {
+                KeyCode::Esc => {
+                    self.status = "Commissioning canceled.".to_string();
+                }
+                KeyCode::Enter => {
+                    let mut pending = pending;
+                    if !value.trim().is_empty() {
+                        pending.device_label = value.trim().to_string();
+                    }
+                    self.modal = Some(Modal::CommissionFabricName {
+                        value: self.state.fabric_label.clone(),
+                        pending,
+                    });
+                }
+                KeyCode::Backspace => {
+                    value.pop();
+                    self.modal = Some(Modal::CommissionDeviceName { pending, value });
+                }
+                KeyCode::Char(ch) => {
+                    value.push(ch);
+                    self.modal = Some(Modal::CommissionDeviceName { pending, value });
+                }
+                _ => self.modal = Some(Modal::CommissionDeviceName { pending, value }),
+            },
+            Modal::CommissionFabricName { pending, mut value } => match key.code {
+                KeyCode::Esc => {
+                    self.status = "Commissioning canceled.".to_string();
+                }
+                KeyCode::Enter => {
+                    let mut pending = pending;
+                    if !value.trim().is_empty() {
+                        pending.fabric_label = value.trim().to_string();
+                    }
+                    if pending.endpoints.is_empty() {
+                        self.queue_task(
+                            PendingTask::FinishCommission(pending),
+                            "Finalizing commissioning...",
+                        );
+                    } else {
+                        let default = pending.endpoints[0]
+                            .label
+                            .clone()
+                            .unwrap_or_else(|| {
+                                format_device_types(&pending.endpoints[0].device_types)
+                            });
+                        self.modal = Some(Modal::CommissionEndpointName {
+                            pending,
+                            index: 0,
+                            value: default,
+                        });
+                    }
+                }
+                KeyCode::Backspace => {
+                    value.pop();
+                    self.modal = Some(Modal::CommissionFabricName { pending, value });
+                }
+                KeyCode::Char(ch) => {
+                    value.push(ch);
+                    self.modal = Some(Modal::CommissionFabricName { pending, value });
+                }
+                _ => self.modal = Some(Modal::CommissionFabricName { pending, value }),
+            },
+            Modal::CommissionEndpointName {
+                mut pending,
+                index,
+                mut value,
+            } => match key.code {
+                KeyCode::Esc => {
+                    self.status = "Commissioning canceled.".to_string();
+                }
+                KeyCode::Enter => {
+                    if !value.trim().is_empty() {
+                        pending.endpoints[index].label = Some(value.trim().to_string());
+                    }
+                    let next = index + 1;
+                    if next >= pending.endpoints.len() {
+                        self.queue_task(
+                            PendingTask::FinishCommission(pending),
+                            "Finalizing commissioning...",
+                        );
+                    } else {
+                        let default = pending.endpoints[next]
+                            .label
+                            .clone()
+                            .unwrap_or_else(|| {
+                                format_device_types(&pending.endpoints[next].device_types)
+                            });
+                        self.modal = Some(Modal::CommissionEndpointName {
+                            pending,
+                            index: next,
+                            value: default,
+                        });
+                    }
+                }
+                KeyCode::Backspace => {
+                    value.pop();
+                    self.modal = Some(Modal::CommissionEndpointName {
+                        pending,
+                        index,
+                        value,
+                    });
+                }
+                KeyCode::Char(ch) => {
+                    value.push(ch);
+                    self.modal = Some(Modal::CommissionEndpointName {
+                        pending,
+                        index,
+                        value,
+                    });
+                }
+                _ => {
+                    self.modal = Some(Modal::CommissionEndpointName {
+                        pending,
+                        index,
+                        value,
+                    });
+                }
+            },
+        }
+
+        Ok(())
+    }
+
+    async fn run_input_submit(&mut self, dialog: InputDialog) -> Result<()> {
+        match dialog.submit {
+            SubmitAction::CommissionSetupCode { device_index } => {
+                self.queue_task(
+                    PendingTask::StartCommission {
+                        device_index,
+                        setup_code: dialog.value,
+                    },
+                    "Starting commissioning...",
+                );
+            }
+            SubmitAction::RenameEndpoint { endpoint_index } => {
+                let Screen::Manage(manage) = &mut self.screen else {
+                    return Ok(());
+                };
+                let endpoint = manage
+                    .endpoints
+                    .get_mut(endpoint_index)
+                    .context("endpoint not found")?;
+                endpoint.label = Some(dialog.value.trim().to_string());
+                upsert_endpoint_alias(
+                    &mut self.state.endpoint_aliases,
+                    EndpointAlias {
+                        node_id: manage.device.node_id,
+                        endpoint_id: endpoint.id,
+                        label: dialog.value.trim().to_string(),
+                    },
+                );
+                self.state.save(STATE_PATH)?;
+                self.status = format!("Saved endpoint {} name.", endpoint.id);
+            }
+            SubmitAction::ChangeFabricLabel => {
+                self.queue_task(
+                    PendingTask::ChangeFabricLabel {
+                        label: dialog.value.trim().to_string(),
+                    },
+                    "Updating fabric label...",
                 );
             }
         }
+        Ok(())
     }
 
-    println!();
-    println!("Commissioned devices");
-    if commissioned.is_empty() {
-        println!("  none found");
-    } else {
-        for (idx, device) in commissioned.iter().enumerate() {
-            let status = match &device.known {
-                Some(known) => format!("managed, node_id={}", known.node_id),
-                None => "discovered only".to_string(),
-            };
-            let name = device
-                .known
-                .as_ref()
-                .map(|known| known.label.as_str())
-                .unwrap_or(device.display_name.as_str());
-            println!(
-                "  [{}] {} | addr: {} | {}",
-                idx + 1,
-                name,
-                first_socket_addr(&device.addresses, device.port),
-                status
+    async fn run_confirm(&mut self, confirm: ConfirmAction) -> Result<()> {
+        match confirm {
+            ConfirmAction::Decommission => {
+                self.queue_task(PendingTask::Decommission, "Decommissioning device...");
+            }
+        }
+        Ok(())
+    }
+
+    async fn run_action_submit(&mut self, dialog: ActionDialog) -> Result<()> {
+        let option = dialog
+            .options
+            .get(dialog.selected)
+            .context("action option not found")?;
+        self.queue_task(
+            PendingTask::InvokeAction {
+                endpoint_index: dialog.endpoint_index,
+                command_id: option.command_id,
+                payload: option.payload.clone(),
+                label: option.label.clone(),
+            },
+            "Sending Actions cluster command...",
+        );
+        Ok(())
+    }
+
+    async fn finish_commission(&mut self, mut pending: PendingCommission) -> Result<()> {
+        update_fabric_label(&mut pending.connection, &pending.fabric_label).await?;
+        self.state.fabric_label = pending.fabric_label.clone();
+
+        upsert_known_device(
+            &mut self.state.devices,
+            KnownDevice {
+                label: pending.device_label.clone(),
+                node_id: pending.node_id,
+                last_address: pending.address.clone(),
+            },
+        );
+        for endpoint in &pending.endpoints {
+            let label = endpoint
+                .label
+                .clone()
+                .unwrap_or_else(|| format_device_types(&endpoint.device_types));
+            upsert_endpoint_alias(
+                &mut self.state.endpoint_aliases,
+                EndpointAlias {
+                    node_id: pending.node_id,
+                    endpoint_id: endpoint.id,
+                    label,
+                },
             );
-            if device.known.is_some() && device.display_name != name {
-                println!("      service: {}", device.display_name);
+        }
+
+        self.state.save(STATE_PATH)?;
+        self.status = format!(
+            "Commissioned {} with node_id={}.",
+            pending.device_label, pending.node_id
+        );
+        self.refresh_scan().await;
+        Ok(())
+    }
+
+    fn queue_task(&mut self, task: PendingTask, message: &str) {
+        self.pending_task = Some(task);
+        self.modal = Some(Modal::Message(message.to_string()));
+        self.status = message.to_string();
+    }
+
+    async fn run_pending_task(&mut self) -> Result<()> {
+        let Some(task) = self.pending_task.take() else {
+            return Ok(());
+        };
+        self.modal = None;
+
+        match task {
+            PendingTask::RefreshScan => {
+                self.refresh_scan().await;
+            }
+            PendingTask::StartCommission {
+                device_index,
+                setup_code,
+            } => {
+                let pin = parse_setup_code(setup_code.trim())?;
+                let device = self
+                    .commissionable
+                    .get(device_index)
+                    .cloned()
+                    .context("commissionable device not found")?;
+                self.status = format!("Commissioning {}...", device.display_name);
+                let pending = start_commission(&self.state, &device, pin).await?;
+                let device_name = pending.device_label.clone();
+                self.modal = Some(Modal::CommissionDeviceName {
+                    pending,
+                    value: device_name,
+                });
+            }
+            PendingTask::OpenSelectedCommissioned => {
+                self.open_selected_commissioned().await?;
+            }
+            PendingTask::EndpointOn { endpoint_index } => {
+                let Screen::Manage(manage) = &mut self.screen else {
+                    return Ok(());
+                };
+                let endpoint = manage
+                    .endpoints
+                    .get(endpoint_index)
+                    .context("endpoint not found")?;
+                manage
+                    .connection
+                    .invoke_request(
+                        endpoint.id,
+                        defs::CLUSTER_ID_ON_OFF,
+                        defs::CLUSTER_ON_OFF_CMD_ID_ON,
+                        &[],
+                    )
+                    .await?;
+                self.status = format!("Sent On command to endpoint {}.", endpoint.id);
+            }
+            PendingTask::EndpointOff { endpoint_index } => {
+                let Screen::Manage(manage) = &mut self.screen else {
+                    return Ok(());
+                };
+                let endpoint = manage
+                    .endpoints
+                    .get(endpoint_index)
+                    .context("endpoint not found")?;
+                manage
+                    .connection
+                    .invoke_request(
+                        endpoint.id,
+                        defs::CLUSTER_ID_ON_OFF,
+                        defs::CLUSTER_ON_OFF_CMD_ID_OFF,
+                        &[],
+                    )
+                    .await?;
+                self.status = format!("Sent Off command to endpoint {}.", endpoint.id);
+            }
+            PendingTask::ChangeFabricLabel { label } => {
+                let Screen::Manage(manage) = &mut self.screen else {
+                    return Ok(());
+                };
+                update_fabric_label(&mut manage.connection, &label).await?;
+                self.state.fabric_label = label;
+                self.state.save(STATE_PATH)?;
+                self.status = "Fabric label updated.".to_string();
+            }
+            PendingTask::InvokeAction {
+                endpoint_index,
+                command_id,
+                payload,
+                label,
+            } => {
+                let Screen::Manage(manage) = &mut self.screen else {
+                    return Ok(());
+                };
+                let endpoint = manage
+                    .endpoints
+                    .get(endpoint_index)
+                    .context("endpoint not found")?;
+                manage
+                    .connection
+                    .invoke_request(endpoint.id, defs::CLUSTER_ID_ACTIONS, command_id, &payload)
+                    .await?;
+                self.status = format!("Sent {label} to endpoint {}.", endpoint.id);
+            }
+            PendingTask::Decommission => {
+                let Screen::Manage(manage) = &mut self.screen else {
+                    return Ok(());
+                };
+                let node_id = manage.device.node_id;
+                let label = manage.device.label.clone();
+                decommission_device(&mut manage.connection).await?;
+                self.state.devices.retain(|device| device.node_id != node_id);
+                self.state
+                    .endpoint_aliases
+                    .retain(|alias| alias.node_id != node_id);
+                self.state.save(STATE_PATH)?;
+                self.screen = Screen::Overview;
+                self.status = format!("Decommissioned {label}.");
+                self.refresh_scan().await;
+            }
+            PendingTask::FinishCommission(pending) => {
+                self.finish_commission(pending).await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn open_selected_commissioned(&mut self) -> Result<()> {
+        if self.commissioned.is_empty() {
+            return Ok(());
+        }
+
+        let commissioned = self
+            .commissioned
+            .get(self.selected_commissioned)
+            .context("commissioned device not found")?;
+        let mut device = match &commissioned.known {
+            Some(known) => known.clone(),
+            None => {
+                self.status = "Selected commissioned device is not managed by this client."
+                    .to_string();
+                return Ok(());
+            }
+        };
+
+        device.last_address = first_socket_addr(&commissioned.addresses, commissioned.port);
+        let mut connection = connect_known_device(&self.state, &device).await?;
+        let mut endpoints = load_endpoints(&mut connection).await?;
+        apply_endpoint_aliases(&self.state, device.node_id, &mut endpoints);
+
+        self.screen = Screen::Manage(ManageState {
+            device,
+            connection,
+            endpoints,
+            selected_endpoint: 0,
+        });
+        self.status =
+            "Manage mode: o=on, p=off, a=actions, n=rename endpoint, f=fabric, d=decommission."
+                .to_string();
+        Ok(())
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let state = AppState::load(STATE_PATH)?;
+    ensure_credentials(&state)?;
+
+    let mut app = App::new(state);
+    let mut terminal = setup_terminal()?;
+    app.queue_task(PendingTask::RefreshScan, "Scanning LAN for Matter devices...");
+
+    let result = run_app(&mut terminal, &mut app).await;
+    restore_terminal(&mut terminal)?;
+    result
+}
+
+async fn run_app(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    app: &mut App,
+) -> Result<()> {
+    while !app.quit {
+        terminal.draw(|frame| draw(frame, app))?;
+        if app.pending_task.is_some() {
+            if let Err(err) = app.run_pending_task().await {
+                app.modal = Some(Modal::Message(format!("{err:#}")));
+                app.status = format!("{err:#}");
+            }
+            continue;
+        }
+        if event::poll(Duration::from_millis(200))? {
+            if let Event::Key(key) = event::read()? {
+                if let Err(err) = app.on_key(key).await {
+                    app.modal = Some(Modal::Message(format!("{err:#}")));
+                }
             }
         }
     }
+    Ok(())
+}
 
-    if !state.devices.is_empty() {
-        println!();
-        println!("Saved devices");
-        for device in &state.devices {
-            println!(
-                "  {} | node_id={} | last_addr={}",
-                device.label, device.node_id, device.last_address
+fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
+    Ok(Terminal::new(backend)?)
+}
+
+fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
+    Ok(())
+}
+
+fn draw(frame: &mut Frame<'_>, app: &App) {
+    match &app.screen {
+        Screen::Overview => draw_overview(frame, app),
+        Screen::Manage(manage) => draw_manage(frame, app, manage),
+    }
+
+    if let Some(modal) = &app.modal {
+        draw_modal(frame, modal);
+    }
+}
+
+fn draw_overview(frame: &mut Frame<'_>, app: &App) {
+    let areas = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Min(10),
+        Constraint::Length(8),
+        Constraint::Length(3),
+    ])
+    .split(frame.area());
+
+    let header = Paragraph::new(format!(
+        "Matter Client\nController ID: {} | Fabric Label: {}",
+        app.state.controller_id, app.state.fabric_label
+    ))
+    .block(Block::default().borders(Borders::ALL).title("Session"));
+    frame.render_widget(header, areas[0]);
+
+    let body = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(areas[1]);
+
+    let commissionable_items = app
+        .commissionable
+        .iter()
+        .map(|device| {
+            let mut lines = vec![
+                Line::from(device.display_name.clone()),
+                Line::from(format!(
+                    "{} | {}",
+                    device.device_type,
+                    first_socket_addr(&device.addresses, device.port)
+                ))
+                .dim(),
+            ];
+            let metadata = format!(
+                "disc={} vid={} pid={}",
+                device.discriminator.as_deref().unwrap_or("-"),
+                device.vendor_id.as_deref().unwrap_or("-"),
+                device.product_id.as_deref().unwrap_or("-")
             );
+            lines.push(Line::from(metadata).dim());
+            ListItem::new(lines)
+        })
+        .collect::<Vec<_>>();
+    let mut commissionable_state =
+        list_state(app.selected_commissionable, app.commissionable.is_empty());
+    let commissionable = List::new(commissionable_items)
+        .block(focus_block(
+            "Commissionable Devices",
+            app.focus == FocusPane::Commissionable,
+        ))
+        .highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan))
+        .highlight_symbol("> ");
+    frame.render_stateful_widget(commissionable, body[0], &mut commissionable_state);
+
+    let commissioned_items = app
+        .commissioned
+        .iter()
+        .map(|device| {
+            let name = device
+                .known
+                .as_ref()
+                .map(|known| known.label.clone())
+                .unwrap_or_else(|| device.display_name.clone());
+            let status = device
+                .known
+                .as_ref()
+                .map(|known| format!("managed, node_id={}", known.node_id))
+                .unwrap_or_else(|| "discovered only".to_string());
+            let mut lines = vec![
+                Line::from(name),
+                Line::from(format!(
+                    "{} | {}",
+                    first_socket_addr(&device.addresses, device.port),
+                    status
+                ))
+                .dim(),
+            ];
+            if device.known.is_some() && device.display_name != lines[0].to_string() {
+                lines.push(Line::from(format!("service: {}", device.display_name)).dim());
+            }
+            ListItem::new(lines)
+        })
+        .collect::<Vec<_>>();
+    let mut commissioned_state =
+        list_state(app.selected_commissioned, app.commissioned.is_empty());
+    let commissioned = List::new(commissioned_items)
+        .block(focus_block(
+            "Commissioned Devices",
+            app.focus == FocusPane::Commissioned,
+        ))
+        .highlight_style(Style::default().fg(Color::Black).bg(Color::Green))
+        .highlight_symbol("> ");
+    frame.render_stateful_widget(commissioned, body[1], &mut commissioned_state);
+
+    let saved = Paragraph::new(saved_devices_lines(&app.state))
+        .block(Block::default().borders(Borders::ALL).title("Saved Devices"))
+        .wrap(Wrap { trim: true });
+    frame.render_widget(saved, areas[2]);
+
+    let footer = Paragraph::new(format!(
+        "{}\nLegend: Tab switch pane | Up/Down move | r refresh scan | c commission selected commissionable device | m or Enter manage selected commissioned device | q quit",
+        app.status
+    ))
+    .block(Block::default().borders(Borders::ALL).title("Footer"));
+    frame.render_widget(footer, areas[3]);
+}
+
+fn draw_manage(frame: &mut Frame<'_>, app: &App, manage: &ManageState) {
+    let areas = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Min(10),
+        Constraint::Length(3),
+    ])
+    .split(frame.area());
+
+    let header = Paragraph::new(format!(
+        "{} | node_id={} | addr={}",
+        manage.device.label, manage.device.node_id, manage.device.last_address
+    ))
+    .block(Block::default().borders(Borders::ALL).title("Managed Device"));
+    frame.render_widget(header, areas[0]);
+
+    let body = Layout::horizontal([Constraint::Percentage(42), Constraint::Percentage(58)])
+        .split(areas[1]);
+
+    let endpoint_items = manage
+        .endpoints
+        .iter()
+        .map(|endpoint| {
+            let label = endpoint
+                .label
+                .clone()
+                .unwrap_or_else(|| "unnamed".to_string());
+            let capabilities = endpoint_capabilities(endpoint);
+            ListItem::new(vec![
+                Line::from(format!("ep{} {}", endpoint.id, label)),
+                Line::from(capabilities).dim(),
+            ])
+        })
+        .collect::<Vec<_>>();
+    let mut endpoint_state = list_state(manage.selected_endpoint, manage.endpoints.is_empty());
+    let endpoint_list = List::new(endpoint_items)
+        .block(Block::default().borders(Borders::ALL).title("Endpoints"))
+        .highlight_style(Style::default().fg(Color::Black).bg(Color::Yellow))
+        .highlight_symbol("> ");
+    frame.render_stateful_widget(endpoint_list, body[0], &mut endpoint_state);
+
+    let details = selected_endpoint_details(manage);
+    let detail_widget = Paragraph::new(details)
+        .block(Block::default().borders(Borders::ALL).title("Details"))
+        .wrap(Wrap { trim: true });
+    frame.render_widget(detail_widget, body[1]);
+
+    let footer = Paragraph::new(format!(
+        "{}\nLegend: Up/Down move | o on | p off | a actions | n rename endpoint | f fabric label | d decommission | b or Esc back",
+        app.status
+    ))
+    .block(Block::default().borders(Borders::ALL).title("Footer"));
+    frame.render_widget(footer, areas[2]);
+}
+
+fn draw_modal(frame: &mut Frame<'_>, modal: &Modal) {
+    let area = centered_rect(70, 35, frame.area());
+    frame.render_widget(Clear, area);
+
+    match modal {
+        Modal::Message(message) => {
+            let paragraph = Paragraph::new(format!("{message}\n\nEnter or Esc closes this dialog"))
+                .block(Block::default().borders(Borders::ALL).title("Message"))
+                .wrap(Wrap { trim: true });
+            frame.render_widget(paragraph, area);
+        }
+        Modal::Confirm(dialog) => {
+            let paragraph = Paragraph::new(format!("{}\n\n{}", dialog.message, dialog.title))
+                .block(Block::default().borders(Borders::ALL).title("Confirm"))
+                .wrap(Wrap { trim: true });
+            frame.render_widget(paragraph, area);
+        }
+        Modal::Input(dialog) => {
+            draw_input_box(frame, area, &dialog.title, &dialog.value, &dialog.help);
+        }
+        Modal::Action(dialog) => {
+            let items = dialog
+                .options
+                .iter()
+                .map(|option| ListItem::new(option.label.clone()))
+                .collect::<Vec<_>>();
+            let mut state = list_state(dialog.selected, dialog.options.is_empty());
+            let list = List::new(items)
+                .block(Block::default().borders(Borders::ALL).title(dialog.title.clone()))
+                .highlight_style(Style::default().fg(Color::Black).bg(Color::Magenta))
+                .highlight_symbol("> ");
+            frame.render_stateful_widget(list, area, &mut state);
+        }
+        Modal::CommissionDeviceName { pending, value } => {
+            draw_input_box(
+                frame,
+                area,
+                "Commissioning: Device Name",
+                value,
+                &format!(
+                    "Name the device. Suggested default: {}",
+                    pending.device_label
+                ),
+            );
+        }
+        Modal::CommissionFabricName { pending, value } => {
+            draw_input_box(
+                frame,
+                area,
+                "Commissioning: Fabric Name",
+                value,
+                &format!(
+                    "Set the fabric label for node {}. Default: {}",
+                    pending.node_id, pending.fabric_label
+                ),
+            );
+        }
+        Modal::CommissionEndpointName {
+            pending,
+            index,
+            value,
+        } => {
+            let endpoint = &pending.endpoints[*index];
+            draw_input_box(
+                frame,
+                area,
+                &format!("Commissioning: Endpoint {} Name", endpoint.id),
+                value,
+                "Press Enter to accept this endpoint label.",
+            );
+        }
+    }
+}
+
+fn draw_input_box(frame: &mut Frame<'_>, area: Rect, title: &str, value: &str, help: &str) {
+    let paragraph = Paragraph::new(format!("{help}\n\n{value}_"))
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .wrap(Wrap { trim: true });
+    frame.render_widget(paragraph, area);
+}
+
+fn focus_block<'a>(title: &'a str, focused: bool) -> Block<'a> {
+    let style = if focused {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default()
+    };
+    Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_style(style)
+}
+
+fn saved_devices_lines(state: &AppState) -> Text<'static> {
+    let mut lines = Vec::new();
+    if state.devices.is_empty() {
+        lines.push(Line::from("No saved devices."));
+    } else {
+        for device in &state.devices {
+            lines.push(Line::from(format!(
+                "{} | node_id={} | {}",
+                device.label, device.node_id, device.last_address
+            )));
             let aliases = state
                 .endpoint_aliases
                 .iter()
                 .filter(|alias| alias.node_id == device.node_id)
+                .map(|alias| format!("ep{}={}", alias.endpoint_id, alias.label))
                 .collect::<Vec<_>>();
             if !aliases.is_empty() {
-                let summary = aliases
-                    .iter()
-                    .map(|alias| format!("ep{}={}", alias.endpoint_id, alias.label))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                println!("      endpoints: {summary}");
+                lines.push(Line::from(format!("  {}", aliases.join(", "))).dim());
             }
         }
     }
-
-    println!();
+    Text::from(lines)
 }
 
-async fn commission_flow(state: &mut AppState, devices: &[CommissionableDevice]) -> Result<()> {
-    if devices.is_empty() {
-        return Err(anyhow!("no commissionable devices found"));
+fn selected_endpoint_details(manage: &ManageState) -> Text<'static> {
+    let Some(endpoint) = manage.endpoints.get(manage.selected_endpoint) else {
+        return Text::from("No endpoints.");
+    };
+
+    let mut lines = vec![
+        Line::from(format!("Endpoint: {}", endpoint.id)),
+        Line::from(format!(
+            "Label: {}",
+            endpoint.label.clone().unwrap_or_else(|| "unnamed".to_string())
+        )),
+        Line::from(format!(
+            "Device types: {}",
+            format_device_types(&endpoint.device_types)
+        )),
+        Line::from(format!(
+            "Capabilities: {}",
+            endpoint_capabilities(endpoint)
+        )),
+    ];
+
+    if !endpoint.actions.is_empty() {
+        lines.push(Line::from("Actions:"));
+        for action in &endpoint.actions {
+            lines.push(Line::from(format!(
+                "  {} (id={})",
+                action.name.clone().unwrap_or_else(|| "unnamed".to_string()),
+                action.action_id.unwrap_or_default()
+            )));
+        }
     }
 
-    let index = select_index("Commission which device", devices.len())?;
-    let device = devices[index].clone();
-    let setup_code = prompt(
-        "Matter setup code (8-digit passcode, 11-digit/xxxx-xxx-xxxx manual code, or MT: QR payload)",
-    )?;
-    let pin = parse_setup_code(&setup_code)?;
+    Text::from(lines)
+}
 
+fn endpoint_capabilities(endpoint: &EndpointSummary) -> String {
+    let mut caps = Vec::new();
+    if endpoint.has_on_off {
+        caps.push("on/off");
+    }
+    if !endpoint.actions.is_empty() {
+        caps.push("actions");
+    }
+    if caps.is_empty() {
+        "none".to_string()
+    } else {
+        caps.join(", ")
+    }
+}
+
+fn list_state(selected: usize, empty: bool) -> ListState {
+    let mut state = ListState::default();
+    if !empty {
+        state.select(Some(selected));
+    }
+    state
+}
+
+fn centered_rect(percent_x: u16, percent_y: u16, rect: Rect) -> Rect {
+    let popup = Layout::vertical([
+        Constraint::Percentage((100 - percent_y) / 2),
+        Constraint::Percentage(percent_y),
+        Constraint::Percentage((100 - percent_y) / 2),
+    ])
+    .split(rect);
+    Layout::horizontal([
+        Constraint::Percentage((100 - percent_x) / 2),
+        Constraint::Percentage(percent_x),
+        Constraint::Percentage((100 - percent_x) / 2),
+    ])
+    .split(popup[1])[1]
+}
+
+fn clamp_selection(current: usize, len: usize) -> usize {
+    if len == 0 {
+        0
+    } else {
+        current.min(len - 1)
+    }
+}
+
+fn next_index(current: usize, len: usize) -> usize {
+    if len == 0 {
+        0
+    } else {
+        (current + 1).min(len - 1)
+    }
+}
+
+fn build_action_dialog(endpoint: &EndpointSummary, endpoint_index: usize) -> Result<ActionDialog> {
+    let mut options = Vec::new();
+    for action in &endpoint.actions {
+        let action_id = action.action_id.context("action missing action_id")?;
+        let invoke_id = next_invoke_id();
+        let action_name = action.name.clone().unwrap_or_else(|| "unnamed".to_string());
+        options.push(ActionOption {
+            label: format!("Instant: {action_name}"),
+            command_id: defs::CLUSTER_ACTIONS_CMD_ID_INSTANTACTION,
+            payload: codec::actions_cluster::encode_instant_action(action_id, invoke_id)?,
+        });
+        options.push(ActionOption {
+            label: format!("Start: {action_name}"),
+            command_id: defs::CLUSTER_ACTIONS_CMD_ID_STARTACTION,
+            payload: codec::actions_cluster::encode_start_action(action_id, invoke_id)?,
+        });
+        options.push(ActionOption {
+            label: format!("Stop: {action_name}"),
+            command_id: defs::CLUSTER_ACTIONS_CMD_ID_STOPACTION,
+            payload: codec::actions_cluster::encode_stop_action(action_id, invoke_id)?,
+        });
+        options.push(ActionOption {
+            label: format!("Pause: {action_name}"),
+            command_id: defs::CLUSTER_ACTIONS_CMD_ID_PAUSEACTION,
+            payload: codec::actions_cluster::encode_pause_action(action_id, invoke_id)?,
+        });
+        options.push(ActionOption {
+            label: format!("Resume: {action_name}"),
+            command_id: defs::CLUSTER_ACTIONS_CMD_ID_RESUMEACTION,
+            payload: codec::actions_cluster::encode_resume_action(action_id, invoke_id)?,
+        });
+        options.push(ActionOption {
+            label: format!("Enable: {action_name}"),
+            command_id: defs::CLUSTER_ACTIONS_CMD_ID_ENABLEACTION,
+            payload: codec::actions_cluster::encode_enable_action(action_id, invoke_id)?,
+        });
+        options.push(ActionOption {
+            label: format!("Disable: {action_name}"),
+            command_id: defs::CLUSTER_ACTIONS_CMD_ID_DISABLEACTION,
+            payload: codec::actions_cluster::encode_disable_action(action_id, invoke_id)?,
+        });
+    }
+
+    Ok(ActionDialog {
+        title: format!("Endpoint {} Actions", endpoint.id),
+        endpoint_index,
+        options,
+        selected: 0,
+    })
+}
+
+async fn start_commission(
+    state: &AppState,
+    device: &CommissionableDevice,
+    pin: u32,
+) -> Result<PendingCommission> {
     ensure_credentials(state)?;
 
     let cm: Arc<dyn CertManager> = certmanager::FileCertManager::load(CERT_PATH)?;
@@ -306,272 +1425,40 @@ async fn commission_flow(state: &mut AppState, devices: &[CommissionableDevice])
     let connection = transport.create_connection(&address).await;
     let node_id = state.next_node_id();
 
-    println!("Commissioning {} at {}...", device.display_name, address);
-    let mut session = controller
+    let mut connection = controller
         .commission(&connection, pin, node_id, state.controller_id)
         .await?;
 
-    let detected_label = detect_device_label(&mut session, 0)
+    let detected_label = detect_device_label(&mut connection, 0)
         .await
         .unwrap_or_else(|| device.display_name.clone());
-    let label = prompt_with_default("Device name", &detected_label)?;
-    let fabric_label = prompt_with_default("Fabric name", &state.fabric_label)?;
-    update_fabric_label(&mut session, &fabric_label).await?;
-    state.fabric_label = fabric_label;
+    let endpoints = load_endpoints(&mut connection).await.unwrap_or_default();
 
-    upsert_known_device(
-        &mut state.devices,
-        KnownDevice {
-            label: label.clone(),
-            node_id,
-            last_address: address.clone(),
-        },
-    );
-    state.save(STATE_PATH)?;
-
-    println!("Commissioned {label} with node_id={node_id}.");
-    let mut endpoints = load_endpoints(&mut session).await.unwrap_or_default();
-    apply_endpoint_aliases(state, node_id, &mut endpoints);
-    if !endpoints.is_empty() {
-        prompt_for_endpoint_aliases(state, node_id, &mut endpoints)?;
-        state.save(STATE_PATH)?;
-        println!("Endpoints:");
-        for endpoint in endpoints {
-            println!(
-                "  endpoint {} | {} | {}",
-                endpoint.id,
-                endpoint
-                    .label
-                    .clone()
-                    .unwrap_or_else(|| "unnamed".to_string()),
-                format_device_types(&endpoint.device_types)
-            );
-        }
-    }
-    wait_for_enter()?;
-    Ok(())
+    Ok(PendingCommission {
+        connection,
+        node_id,
+        address,
+        device_label: detected_label,
+        fabric_label: state.fabric_label.clone(),
+        endpoints,
+    })
 }
 
-async fn manage_flow(state: &mut AppState, devices: &[CommissionedDevice]) -> Result<()> {
-    let mut choices: Vec<KnownDevice> = devices
-        .iter()
-        .filter_map(|device| device.known.clone())
-        .collect();
-    if choices.is_empty() {
-        choices = state.devices.clone();
-    }
-    if choices.is_empty() {
-        return Err(anyhow!("no managed commissioned devices available"));
-    }
-
-    println!("Managed devices:");
-    for (idx, device) in choices.iter().enumerate() {
-        println!(
-            "  [{}] {} | node_id={} | addr={}",
-            idx + 1,
-            device.label,
-            device.node_id,
-            device.last_address
-        );
-    }
-
-    let index = select_index("Open which device", choices.len())?;
-    let mut device = choices[index].clone();
-    let current_address = devices
-        .iter()
-        .filter_map(|entry| entry.known.as_ref().map(|known| (entry, known)))
-        .find(|(_, known)| known.node_id == device.node_id)
-        .map(|(entry, _)| first_socket_addr(&entry.addresses, entry.port))
-        .unwrap_or_else(|| device.last_address.clone());
-    device.last_address = current_address.clone();
-
-    let mut connection = connect_known_device(state, &device).await?;
-    let mut endpoints = load_endpoints(&mut connection).await?;
-    apply_endpoint_aliases(state, device.node_id, &mut endpoints);
-
-    loop {
-        clear_screen();
-        println!(
-            "{} | node_id={} | addr={}",
-            device.label, device.node_id, device.last_address
-        );
-        println!();
-
-        if endpoints.is_empty() {
-            println!("No endpoints discovered.");
-        } else {
-            for endpoint in &endpoints {
-                println!(
-                    "  endpoint {} | {} | {}{}{}",
-                    endpoint.id,
-                    endpoint
-                        .label
-                        .clone()
-                        .unwrap_or_else(|| "unnamed".to_string()),
-                    format_device_types(&endpoint.device_types),
-                    if endpoint.has_on_off { " | on/off" } else { "" },
-                    if endpoint.actions.is_empty() {
-                        ""
-                    } else {
-                        " | actions"
-                    }
-                );
-            }
-        }
-
-        println!();
-        match prompt("Select: [e]ndpoint action, [f]abric name, [x] decommission, [b]ack")?
-            .as_str()
-        {
-            "b" | "back" => break,
-            "e" | "endpoint" => {
-                endpoint_action_flow(&mut connection, &endpoints).await?;
-            }
-            "f" | "fabric" => {
-                let new_label = prompt_with_default("Fabric name", &state.fabric_label)?;
-                update_fabric_label(&mut connection, &new_label).await?;
-                state.fabric_label = new_label;
-                state.save(STATE_PATH)?;
-                println!("Fabric label updated.");
-                wait_for_enter()?;
-            }
-            "x" | "decommission" => {
-                decommission_device(&mut connection).await?;
-                state.devices.retain(|saved| saved.node_id != device.node_id);
-                state.endpoint_aliases.retain(|alias| alias.node_id != device.node_id);
-                state.save(STATE_PATH)?;
-                println!("Device decommissioned from this controller.");
-                wait_for_enter()?;
-                break;
-            }
-            _ => {
-                println!("Unknown command.");
-                wait_for_enter()?;
-            }
-        }
-    }
-
-    Ok(())
-}
-
-async fn endpoint_action_flow(
+async fn update_fabric_label(
     connection: &mut controller::Connection,
-    endpoints: &[EndpointSummary],
+    label: &str,
 ) -> Result<()> {
-    if endpoints.is_empty() {
-        return Err(anyhow!("no endpoints available"));
-    }
-
-    let index = select_index("Choose endpoint", endpoints.len())?;
-    let endpoint = &endpoints[index];
-
-    println!("Endpoint {} selected.", endpoint.id);
-    if endpoint.has_on_off {
-        println!("  [1] On");
-        println!("  [2] Off");
-    }
-    if !endpoint.actions.is_empty() {
-        println!("  [3] Actions cluster command");
-    }
-
-    let choice = prompt("Action")?;
-    match choice.as_str() {
-        "1" if endpoint.has_on_off => {
-            connection
-                .invoke_request(
-                    endpoint.id,
-                    defs::CLUSTER_ID_ON_OFF,
-                    defs::CLUSTER_ON_OFF_CMD_ID_ON,
-                    &[],
-                )
-                .await?;
-            println!("On command sent.");
-        }
-        "2" if endpoint.has_on_off => {
-            connection
-                .invoke_request(
-                    endpoint.id,
-                    defs::CLUSTER_ID_ON_OFF,
-                    defs::CLUSTER_ON_OFF_CMD_ID_OFF,
-                    &[],
-                )
-                .await?;
-            println!("Off command sent.");
-        }
-        "3" if !endpoint.actions.is_empty() => {
-            invoke_cluster_action(connection, endpoint).await?;
-        }
-        _ => return Err(anyhow!("unsupported action selection")),
-    }
-
-    wait_for_enter()?;
-    Ok(())
-}
-
-async fn invoke_cluster_action(
-    connection: &mut controller::Connection,
-    endpoint: &EndpointSummary,
-) -> Result<()> {
-    for (idx, action) in endpoint.actions.iter().enumerate() {
-        println!(
-            "  [{}] {} (action_id={})",
-            idx + 1,
-            action.name.clone().unwrap_or_else(|| "unnamed".to_string()),
-            action.action_id.unwrap_or_default()
-        );
-    }
-    let action_index = select_index("Choose action", endpoint.actions.len())?;
-    let action = &endpoint.actions[action_index];
-    let action_id = action
-        .action_id
-        .context("selected action does not have action_id")?;
-
-    println!("  [1] Instant");
-    println!("  [2] Start");
-    println!("  [3] Stop");
-    println!("  [4] Pause");
-    println!("  [5] Resume");
-    println!("  [6] Enable");
-    println!("  [7] Disable");
-
-    let invoke_id = next_invoke_id();
-    let selection = prompt("Action command")?;
-    let (command_id, payload) = match selection.as_str() {
-        "1" => (
-            defs::CLUSTER_ACTIONS_CMD_ID_INSTANTACTION,
-            codec::actions_cluster::encode_instant_action(action_id, invoke_id)?,
-        ),
-        "2" => (
-            defs::CLUSTER_ACTIONS_CMD_ID_STARTACTION,
-            codec::actions_cluster::encode_start_action(action_id, invoke_id)?,
-        ),
-        "3" => (
-            defs::CLUSTER_ACTIONS_CMD_ID_STOPACTION,
-            codec::actions_cluster::encode_stop_action(action_id, invoke_id)?,
-        ),
-        "4" => (
-            defs::CLUSTER_ACTIONS_CMD_ID_PAUSEACTION,
-            codec::actions_cluster::encode_pause_action(action_id, invoke_id)?,
-        ),
-        "5" => (
-            defs::CLUSTER_ACTIONS_CMD_ID_RESUMEACTION,
-            codec::actions_cluster::encode_resume_action(action_id, invoke_id)?,
-        ),
-        "6" => (
-            defs::CLUSTER_ACTIONS_CMD_ID_ENABLEACTION,
-            codec::actions_cluster::encode_enable_action(action_id, invoke_id)?,
-        ),
-        "7" => (
-            defs::CLUSTER_ACTIONS_CMD_ID_DISABLEACTION,
-            codec::actions_cluster::encode_disable_action(action_id, invoke_id)?,
-        ),
-        _ => return Err(anyhow!("unsupported action command")),
-    };
-
+    let payload = codec::operational_credential_cluster::encode_update_fabric_label(
+        label.to_string(),
+    )?;
     connection
-        .invoke_request(endpoint.id, defs::CLUSTER_ID_ACTIONS, command_id, &payload)
+        .invoke_request(
+            0,
+            defs::CLUSTER_ID_OPERATIONAL_CREDENTIALS,
+            defs::CLUSTER_OPERATIONAL_CREDENTIALS_CMD_ID_UPDATEFABRICLABEL,
+            &payload,
+        )
         .await?;
-    println!("Actions cluster command sent.");
     Ok(())
 }
 
@@ -598,24 +1485,6 @@ async fn decommission_device(connection: &mut controller::Connection) -> Result<
     Ok(())
 }
 
-async fn update_fabric_label(
-    connection: &mut controller::Connection,
-    label: &str,
-) -> Result<()> {
-    let payload = codec::operational_credential_cluster::encode_update_fabric_label(
-        label.to_string(),
-    )?;
-    connection
-        .invoke_request(
-            0,
-            defs::CLUSTER_ID_OPERATIONAL_CREDENTIALS,
-            defs::CLUSTER_OPERATIONAL_CREDENTIALS_CMD_ID_UPDATEFABRICLABEL,
-            &payload,
-        )
-        .await?;
-    Ok(())
-}
-
 async fn connect_known_device(
     state: &AppState,
     device: &KnownDevice,
@@ -631,64 +1500,83 @@ async fn connect_known_device(
 }
 
 async fn load_endpoints(connection: &mut controller::Connection) -> Result<Vec<EndpointSummary>> {
-    let parts = connection
+    let mut endpoint_ids = vec![0u16];
+    if let Ok(parts) = connection
         .read_request2(
             0,
             defs::CLUSTER_ID_DESCRIPTOR,
             defs::CLUSTER_DESCRIPTOR_ATTR_ID_PARTSLIST,
         )
-        .await?;
-    let mut out = Vec::new();
-    for endpoint_id in codec::descriptor_cluster::decode_parts_list(&parts)? {
-        let server_list = connection
-            .read_request2(
-                endpoint_id,
-                defs::CLUSTER_ID_DESCRIPTOR,
-                defs::CLUSTER_DESCRIPTOR_ATTR_ID_SERVERLIST,
-            )
-            .await?;
-        let clusters = codec::descriptor_cluster::decode_server_list(&server_list)?;
-
-        let device_types_raw = connection
-            .read_request2(
-                endpoint_id,
-                defs::CLUSTER_ID_DESCRIPTOR,
-                defs::CLUSTER_DESCRIPTOR_ATTR_ID_DEVICETYPELIST,
-            )
-            .await?;
-        let device_types = codec::descriptor_cluster::decode_device_type_list(&device_types_raw)?
-            .into_iter()
-            .filter_map(|item| item.device_type)
-            .map(|id| {
-                dt_names::get_device_type_name(id)
-                    .map(str::to_string)
-                    .unwrap_or_else(|| format!("0x{id:04X}"))
-            })
-            .collect::<Vec<_>>();
-
-        let label = detect_device_label(connection, endpoint_id).await;
-        let actions = if clusters.contains(&defs::CLUSTER_ID_ACTIONS) {
-            let tlv = connection
-                .read_request2(
-                    endpoint_id,
-                    defs::CLUSTER_ID_ACTIONS,
-                    defs::CLUSTER_ACTIONS_ATTR_ID_ACTIONLIST,
-                )
-                .await?;
-            codec::actions_cluster::decode_action_list(&tlv)?
-        } else {
-            Vec::new()
-        };
-
-        out.push(EndpointSummary {
-            id: endpoint_id,
-            label,
-            device_types,
-            has_on_off: clusters.contains(&defs::CLUSTER_ID_ON_OFF),
-            actions,
-        });
+        .await
+    {
+        for endpoint_id in codec::descriptor_cluster::decode_parts_list(&parts)? {
+            if !endpoint_ids.contains(&endpoint_id) {
+                endpoint_ids.push(endpoint_id);
+            }
+        }
     }
+
+    let mut out = Vec::new();
+    for endpoint_id in endpoint_ids {
+        if let Ok(summary) = load_endpoint_summary(connection, endpoint_id).await {
+            out.push(summary);
+        }
+    }
+
     Ok(out)
+}
+
+async fn load_endpoint_summary(
+    connection: &mut controller::Connection,
+    endpoint_id: u16,
+) -> Result<EndpointSummary> {
+    let server_list = connection
+        .read_request2(
+            endpoint_id,
+            defs::CLUSTER_ID_DESCRIPTOR,
+            defs::CLUSTER_DESCRIPTOR_ATTR_ID_SERVERLIST,
+        )
+        .await?;
+    let clusters = codec::descriptor_cluster::decode_server_list(&server_list)?;
+
+    let device_types_raw = connection
+        .read_request2(
+            endpoint_id,
+            defs::CLUSTER_ID_DESCRIPTOR,
+            defs::CLUSTER_DESCRIPTOR_ATTR_ID_DEVICETYPELIST,
+        )
+        .await?;
+    let device_types = codec::descriptor_cluster::decode_device_type_list(&device_types_raw)?
+        .into_iter()
+        .filter_map(|item| item.device_type)
+        .map(|id| {
+            dt_names::get_device_type_name(id)
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("0x{id:04X}"))
+        })
+        .collect::<Vec<_>>();
+
+    let label = detect_device_label(connection, endpoint_id).await;
+    let actions = if clusters.contains(&defs::CLUSTER_ID_ACTIONS) {
+        let tlv = connection
+            .read_request2(
+                endpoint_id,
+                defs::CLUSTER_ID_ACTIONS,
+                defs::CLUSTER_ACTIONS_ATTR_ID_ACTIONLIST,
+            )
+            .await?;
+        codec::actions_cluster::decode_action_list(&tlv)?
+    } else {
+        Vec::new()
+    };
+
+    Ok(EndpointSummary {
+        id: endpoint_id,
+        label,
+        device_types,
+        has_on_off: clusters.contains(&defs::CLUSTER_ID_ON_OFF),
+        actions,
+    })
 }
 
 async fn detect_device_label(
@@ -824,37 +1712,6 @@ fn ensure_credentials(state: &AppState) -> Result<()> {
     Ok(())
 }
 
-fn prompt(label: &str) -> Result<String> {
-    print!("{label}: ");
-    io::stdout().flush()?;
-    let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
-    Ok(input.trim().to_string())
-}
-
-fn prompt_with_default(label: &str, default: &str) -> Result<String> {
-    let value = prompt(&format!("{label} [{default}]"))?;
-    if value.is_empty() {
-        Ok(default.to_string())
-    } else {
-        Ok(value)
-    }
-}
-
-fn select_index(label: &str, len: usize) -> Result<usize> {
-    let raw = prompt(label)?;
-    let index: usize = raw.parse().context("invalid number")?;
-    if index == 0 || index > len {
-        return Err(anyhow!("selection out of range"));
-    }
-    Ok(index - 1)
-}
-
-fn wait_for_enter() -> Result<()> {
-    let _ = prompt("Press Enter")?;
-    Ok(())
-}
-
 fn first_socket_addr(addresses: &[IpAddr], port: u16) -> String {
     let ip = addresses
         .iter()
@@ -929,43 +1786,6 @@ fn apply_endpoint_aliases(state: &AppState, node_id: u64, endpoints: &mut [Endpo
     }
 }
 
-fn prompt_for_endpoint_aliases(
-    state: &mut AppState,
-    node_id: u64,
-    endpoints: &mut [EndpointSummary],
-) -> Result<()> {
-    println!("Endpoint naming");
-    println!("Press Enter to keep the detected name.");
-    for endpoint in endpoints {
-        let detected = endpoint
-            .label
-            .clone()
-            .unwrap_or_else(|| format_device_types(&endpoint.device_types));
-        let answer = prompt_with_default(&format!("Endpoint {} name", endpoint.id), &detected)?;
-        if !answer.is_empty() {
-            endpoint.label = Some(answer.clone());
-            upsert_endpoint_alias(
-                &mut state.endpoint_aliases,
-                EndpointAlias {
-                    node_id,
-                    endpoint_id: endpoint.id,
-                    label: answer,
-                },
-            );
-        } else if let Some(label) = endpoint.label.clone() {
-            upsert_endpoint_alias(
-                &mut state.endpoint_aliases,
-                EndpointAlias {
-                    node_id,
-                    endpoint_id: endpoint.id,
-                    label,
-                },
-            );
-        }
-    }
-    Ok(())
-}
-
 fn upsert_endpoint_alias(aliases: &mut Vec<EndpointAlias>, alias: EndpointAlias) {
     if let Some(existing) = aliases
         .iter_mut()
@@ -1019,11 +1839,6 @@ fn unescape_field(value: &str) -> String {
         }
     }
     out
-}
-
-fn clear_screen() {
-    print!("\x1B[2J\x1B[H");
-    let _ = io::stdout().flush();
 }
 
 fn parse_setup_code(input: &str) -> Result<u32> {
@@ -1091,14 +1906,7 @@ fn decode_qr_payload_passcode(payload: &str) -> Result<u32> {
         .enumerate()
         .fold(0u128, |acc, (idx, byte)| acc | ((*byte as u128) << (idx * 8)));
 
-    let _version = extract_bits(packed, 0, 3) as u8;
-    let _vendor_id = extract_bits(packed, 3, 16) as u16;
-    let _product_id = extract_bits(packed, 19, 16) as u16;
-    let _commissioning_flow = extract_bits(packed, 35, 2) as u8;
-    let _discovery_capabilities = extract_bits(packed, 37, 8) as u8;
-    let _discriminator = extract_bits(packed, 45, 12) as u16;
     let passcode = extract_bits(packed, 57, 27) as u32;
-
     Ok(passcode)
 }
 
