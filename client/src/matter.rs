@@ -251,25 +251,25 @@ pub fn build_action_dialog(
         let action_id_u16 = action_id as u16;
         let entries: &[(&str, u32, fn(u16, u32) -> Result<Vec<u8>>)] = &[
             ("Instant", defs::CLUSTER_ACTIONS_CMD_ID_INSTANTACTION, |a, i| {
-                codec::actions_cluster::encode_instant_action(a, i)
+                codec::actions_cluster::encode_instant_action(a, Some(i))
             }),
             ("Start", defs::CLUSTER_ACTIONS_CMD_ID_STARTACTION, |a, i| {
-                codec::actions_cluster::encode_start_action(a, i)
+                codec::actions_cluster::encode_start_action(a, Some(i))
             }),
             ("Stop", defs::CLUSTER_ACTIONS_CMD_ID_STOPACTION, |a, i| {
-                codec::actions_cluster::encode_stop_action(a, i)
+                codec::actions_cluster::encode_stop_action(a, Some(i))
             }),
             ("Pause", defs::CLUSTER_ACTIONS_CMD_ID_PAUSEACTION, |a, i| {
-                codec::actions_cluster::encode_pause_action(a, i)
+                codec::actions_cluster::encode_pause_action(a, Some(i))
             }),
             ("Resume", defs::CLUSTER_ACTIONS_CMD_ID_RESUMEACTION, |a, i| {
-                codec::actions_cluster::encode_resume_action(a, i)
+                codec::actions_cluster::encode_resume_action(a, Some(i))
             }),
             ("Enable", defs::CLUSTER_ACTIONS_CMD_ID_ENABLEACTION, |a, i| {
-                codec::actions_cluster::encode_enable_action(a, i)
+                codec::actions_cluster::encode_enable_action(a, Some(i))
             }),
             ("Disable", defs::CLUSTER_ACTIONS_CMD_ID_DISABLEACTION, |a, i| {
-                codec::actions_cluster::encode_disable_action(a, i)
+                codec::actions_cluster::encode_disable_action(a, Some(i))
             }),
         ];
 
