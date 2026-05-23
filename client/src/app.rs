@@ -16,7 +16,7 @@ use crate::utils::{
     next_index, upsert_endpoint_alias, upsert_known_device,
 };
 
-pub const STATE_PATH: &str = "./client-state.txt";
+pub const STATE_PATH: &str = "./client-state.toml";
 
 pub struct App {
     pub state: AppState,
