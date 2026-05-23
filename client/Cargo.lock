@@ -1015,6 +1015,7 @@ dependencies = [
 [[package]]
 name = "matc"
 version = "0.1.3"
+source = "git+https://github.com/skoky/rust-matc.git?branch=arm_failsafe_fix#ed5e4119622b05a8c47b89722a9897f41f187063"
 dependencies = [
  "aes",
  "anyhow",
