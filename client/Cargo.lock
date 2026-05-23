@@ -1015,8 +1015,6 @@ dependencies = [
 [[package]]
 name = "matc"
 version = "0.1.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "093face0d98976ee98427dd800e4f5726786824c9b7784ac2738cb5b18f9009f"
 dependencies = [
  "aes",
  "anyhow",

@@ -1,0 +1,1602 @@
+/*
+ *
+ *    Copyright (c) 2020-2022 Project CHIP Authors
+ *
+ *    Licensed under the Apache License, Version 2.0 (the "License");
+ *    you may not use this file except in compliance with the License.
+ *    You may obtain a copy of the License at
+ *
+ *        http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *    Unless required by applicable law or agreed to in writing, software
+ *    distributed under the License is distributed on an "AS IS" BASIS,
+ *    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *    See the License for the specific language governing permissions and
+ *    limitations under the License.
+ */
+
+use core::future::Future;
+use core::pin::pin;
+
+use embassy_futures::select::select;
+
+use crate::crypto::Crypto;
+use crate::dm::clusters::net_comm::NetworksAccess;
+use crate::dm::events::EventTLVWrite;
+use crate::dm::{EventId, IMBuffer};
+use crate::error::{Error, ErrorCode};
+use crate::im::{EventNumber, EventPriority};
+use crate::persist::KvBlobStoreAccess;
+use crate::tlv::TLVElement;
+use crate::transport::exchange::Exchange;
+use crate::utils::select::Coalesce;
+use crate::utils::storage::pooled::BufferAccess;
+use crate::utils::sync::DynBase;
+use crate::Matter;
+
+use super::{AttrDetails, AttrId, ClusterId, CmdDetails, EndptId, InvokeReply, ReadReply};
+
+pub use asynch::*;
+
+pub trait DynAttrChangeNotifier: DynBase + AttrChangeNotifier {}
+
+impl<T> DynAttrChangeNotifier for T where T: DynBase + AttrChangeNotifier {}
+
+/// A trait for notifying the data model that the state of an attribute has changed.
+pub trait AttrChangeNotifier {
+    /// Notify that the state of an attribute has changed.
+    ///
+    /// # Arguments
+    /// - `endpoint_id`: The endpoint ID of the cluster that has changed.
+    /// - `cluster_id`: The cluster ID of the cluster that has changed.
+    /// - `attr_id`: The attribute ID of the attribute that has changed.
+    fn notify_attr_changed(&self, endpoint_id: EndptId, cluster_id: ClusterId, attr_id: AttrId);
+
+    /// Notify that every attribute of the given cluster may have changed.
+    ///
+    /// Use this when a single operation mutates many attributes of the same
+    /// cluster and enumerating them would be cumbersome or error-prone (e.g.
+    /// commissioning-window transitions, cluster-wide resets).
+    ///
+    /// Subscriptions whose interest paths intersect `(endpoint_id, cluster_id)`
+    /// at any attribute will be re-reported.
+    fn notify_cluster_changed(&self, endpoint_id: EndptId, cluster_id: ClusterId);
+
+    /// Notify that every attribute on every cluster of the given endpoint may
+    /// have changed.
+    ///
+    /// Typically used when the endpoint's composition changes (dynamic
+    /// endpoints being enabled/disabled, bridge device add/remove, etc.).
+    fn notify_endpoint_changed(&self, endpoint_id: EndptId);
+
+    /// Notify that every attribute on every cluster on every endpoint may
+    /// have changed.
+    ///
+    /// This is the coarsest possible notification and should be used sparingly
+    /// (e.g. global resets, factory reset, etc.). Every active subscription
+    /// will be flagged for re-report.
+    fn notify_all_changed(&self);
+}
+
+impl<T> AttrChangeNotifier for &T
+where
+    T: AttrChangeNotifier,
+{
+    fn notify_attr_changed(&self, endpoint_id: EndptId, cluster_id: ClusterId, attr_id: AttrId) {
+        (**self).notify_attr_changed(endpoint_id, cluster_id, attr_id)
+    }
+
+    fn notify_cluster_changed(&self, endpoint_id: EndptId, cluster_id: ClusterId) {
+        (**self).notify_cluster_changed(endpoint_id, cluster_id)
+    }
+
+    fn notify_endpoint_changed(&self, endpoint_id: EndptId) {
+        (**self).notify_endpoint_changed(endpoint_id)
+    }
+
+    fn notify_all_changed(&self) {
+        (**self).notify_all_changed()
+    }
+}
+
+impl AttrChangeNotifier for () {
+    fn notify_attr_changed(&self, _endpt: EndptId, _clust: ClusterId, _attr: AttrId) {
+        // No-op
+    }
+
+    fn notify_cluster_changed(&self, _endpt: EndptId, _clust: ClusterId) {
+        // No-op
+    }
+
+    fn notify_endpoint_changed(&self, _endpt: EndptId) {
+        // No-op
+    }
+
+    fn notify_all_changed(&self) {
+        // No-op
+    }
+}
+
+/// A trait for notifying the data model that the state of an attribute has changed.
+/// Typically implemented on types that have a notion of a "current" endpoint and a "current" cluster, so that the caller doesn't have to specify them again.
+pub trait OwnAttrChangeNotifier {
+    /// Notify that the state of an attribute has changed.
+    ///
+    /// # Arguments
+    /// - `attr_id`: The attribute ID of the attribute that has changed.
+    fn notify_own_attr_changed(&self, attr_id: AttrId);
+
+    /// Notify that every attribute of our own cluster may have changed.
+    ///
+    /// Use this when a single operation mutates many attributes of the same
+    /// cluster and enumerating them would be cumbersome or error-prone (e.g.
+    /// commissioning-window transitions, cluster-wide resets).
+    ///
+    /// Subscriptions whose interest paths intersect `(endpoint_id, cluster_id)`
+    /// at any attribute will be re-reported.
+    fn notify_own_cluster_changed(&self);
+
+    /// Notify that every attribute on every cluster of our own endpoint may
+    /// have changed.
+    ///
+    /// Typically used when the endpoint's composition changes (dynamic
+    /// endpoints being enabled/disabled, bridge device add/remove, etc.).
+    fn notify_own_endpoint_changed(&self);
+}
+
+impl<T> OwnAttrChangeNotifier for &T
+where
+    T: OwnAttrChangeNotifier,
+{
+    fn notify_own_attr_changed(&self, attr_id: AttrId) {
+        (**self).notify_own_attr_changed(attr_id)
+    }
+
+    fn notify_own_cluster_changed(&self) {
+        (**self).notify_own_cluster_changed()
+    }
+
+    fn notify_own_endpoint_changed(&self) {
+        (**self).notify_own_endpoint_changed()
+    }
+}
+
+/// A trait for emitting events.
+pub trait EventEmitter {
+    /// Emit an event.
+    ///
+    /// # Arguments
+    /// - `endpoint_id`: The endpoint ID of the cluster that emits the event.
+    /// - `cluster_id`: The cluster ID of the cluster that emits the event.
+    /// - `event_id`: The event ID of the event being emitted.
+    /// - `priority`: The priority of the event.
+    /// - `f`: A closure that takes an `EventTLVWrite` and writes the event data into it using TLV encoding.
+    ///
+    /// # Returns
+    /// - `Ok(EventNumber)`: The sequence number of the emitted event, if the event was successfully emitted.
+    /// - `Err(Error)`: An error if the event could not be emitted.
+    fn emit_event<F>(
+        &self,
+        endpoint_id: EndptId,
+        cluster_id: ClusterId,
+        event_id: EventId,
+        priority: EventPriority,
+        f: F,
+    ) -> Result<EventNumber, Error>
+    where
+        F: FnOnce(EventTLVWrite<'_>) -> Result<(), Error>;
+}
+
+impl<T> EventEmitter for &T
+where
+    T: EventEmitter,
+{
+    fn emit_event<F>(
+        &self,
+        endpoint_id: EndptId,
+        cluster_id: ClusterId,
+        event_id: EventId,
+        priority: EventPriority,
+        f: F,
+    ) -> Result<EventNumber, Error>
+    where
+        F: FnOnce(EventTLVWrite<'_>) -> Result<(), Error>,
+    {
+        (**self).emit_event(endpoint_id, cluster_id, event_id, priority, f)
+    }
+}
+
+/// A trait for emitting events typically implemented on types that have a notion of a "current" endpoint and a "current" cluster.
+pub trait OwnEventEmitter {
+    /// Emit an event with the same endpoint ID and cluster ID as the current operation.
+    ///
+    /// This is a convenience method that calls `emit_event` with the endpoint ID and cluster ID of the current operation, so that the caller doesn't have to specify them again.
+    ///
+    /// # Arguments
+    /// - `event_id`: The event ID of the event being emitted.
+    /// - `priority`: The priority of the event.
+    /// - `f`: A closure that takes an `EventTLVWrite` and writes the event data into it using TLV encoding.
+    ///
+    /// # Returns
+    /// - `Ok(EventNumber)`: The sequence number of the emitted event, if the event was successfully emitted.
+    /// - `Err(Error)`: An error if the event could not be emitted.
+    fn emit_own_event<F>(
+        &self,
+        event_id: EventId,
+        priority: EventPriority,
+        f: F,
+    ) -> Result<EventNumber, Error>
+    where
+        F: FnOnce(EventTLVWrite<'_>) -> Result<(), Error>;
+}
+
+impl<T> OwnEventEmitter for &T
+where
+    T: OwnEventEmitter,
+{
+    fn emit_own_event<F>(
+        &self,
+        event_id: EventId,
+        priority: EventPriority,
+        f: F,
+    ) -> Result<EventNumber, Error>
+    where
+        F: FnOnce(EventTLVWrite<'_>) -> Result<(), Error>,
+    {
+        (**self).emit_own_event(event_id, priority, f)
+    }
+}
+
+/// A context super-type that is also passed to the `(Async)Handler::run` method.
+///
+/// It provides access to the Matter instance and to Data Model-related objects,
+/// which could be useful in the context of executing background tasks specific for the concrete handler.
+pub trait HandlerContext: AttrChangeNotifier + EventEmitter {
+    /// Return the Matter object that is associated with this handler
+    fn matter(&self) -> &Matter<'_>;
+
+    /// Return the crypto object that is associated with this operation.
+    fn crypto(&self) -> impl Crypto + '_;
+
+    /// Return a blob store that can be used to persist data across reboots.
+    fn kv(&self) -> impl KvBlobStoreAccess + '_;
+
+    /// Return the networks access object.
+    fn networks(&self) -> impl NetworksAccess + '_;
+
+    /// Return the global handler that this handler is part of.
+    ///
+    /// Useful in case a concrete cluster handler (say, the Scenes one) needs to
+    /// access the global handler so as to invoke read/write/invoke operations on other clusters.
+    fn handler(&self) -> impl AsyncHandler + '_;
+
+    /// Return the buffer pool of the Data Model.
+    ///
+    /// Useful in case e.g. a concrete cluster handler needs to invoke read/write/invoke operations on
+    /// other clusters, and the TLV input/output data for those operations is non-trivial in size.
+    fn buffers(&self) -> impl BufferAccess<IMBuffer> + '_;
+}
+
+impl<T> HandlerContext for &T
+where
+    T: HandlerContext,
+{
+    fn matter(&self) -> &Matter<'_> {
+        (**self).matter()
+    }
+
+    fn crypto(&self) -> impl Crypto + '_ {
+        (**self).crypto()
+    }
+
+    fn kv(&self) -> impl KvBlobStoreAccess + '_ {
+        (**self).kv()
+    }
+
+    fn networks(&self) -> impl NetworksAccess + '_ {
+        (**self).networks()
+    }
+
+    fn handler(&self) -> impl AsyncHandler + '_ {
+        (**self).handler()
+    }
+
+    fn buffers(&self) -> impl BufferAccess<IMBuffer> + '_ {
+        (**self).buffers()
+    }
+}
+
+/// A context super-type that is passed to the handler when processing an attribute read/write or a command invoke operation.
+pub trait OperationContext: HandlerContext + OwnAttrChangeNotifier + OwnEventEmitter {
+    /// Return the exchange object that is associated with this operation.
+    fn exchange(&self) -> &Exchange<'_>;
+
+    /// Return the endpoint ID that is associated with this operation.
+    fn endpt(&self) -> EndptId;
+
+    /// Return the cluster ID that is associated with this operation.
+    fn cluster(&self) -> ClusterId;
+}
+
+impl<T> OperationContext for &T
+where
+    T: OperationContext,
+{
+    fn exchange(&self) -> &Exchange<'_> {
+        (**self).exchange()
+    }
+
+    fn endpt(&self) -> EndptId {
+        (**self).endpt()
+    }
+
+    fn cluster(&self) -> ClusterId {
+        (**self).cluster()
+    }
+}
+
+/// A context type that is passed to the handler when processing an attribute Read operation.
+pub trait ReadContext: OperationContext {
+    /// Return the attribute object that is associated with this read operation.
+    fn attr(&self) -> &AttrDetails<'_>;
+}
+
+impl<T> ReadContext for &T
+where
+    T: ReadContext,
+{
+    fn attr(&self) -> &AttrDetails<'_> {
+        (**self).attr()
+    }
+}
+
+/// A context type that is passed to the handler when processing an attribute Write operation.
+pub trait WriteContext: OperationContext {
+    /// Return the attribute object that is associated with this write operation.
+    fn attr(&self) -> &AttrDetails<'_>;
+
+    /// Return the attribute data that is associated with this write operation.
+    fn data(&self) -> &TLVElement<'_>;
+
+    /// Notify that the state of the attribute whose write operation is processed has changed.
+    fn notify_changed(&self) {
+        self.notify_attr_changed(
+            self.attr().endpoint_id,
+            self.attr().cluster_id,
+            self.attr().attr_id,
+        );
+    }
+}
+
+impl<T> WriteContext for &T
+where
+    T: WriteContext,
+{
+    fn attr(&self) -> &AttrDetails<'_> {
+        (**self).attr()
+    }
+
+    fn data(&self) -> &TLVElement<'_> {
+        (**self).data()
+    }
+
+    fn notify_changed(&self) {
+        (**self).notify_changed()
+    }
+}
+
+pub trait InvokeContext: OperationContext {
+    /// Return the command object that is associated with this invoke operation.
+    fn cmd(&self) -> &CmdDetails<'_>;
+
+    /// Return the command data that is associated with this invoke operation.
+    fn data(&self) -> &TLVElement<'_>;
+}
+
+impl<T> InvokeContext for &T
+where
+    T: InvokeContext,
+{
+    fn cmd(&self) -> &CmdDetails<'_> {
+        (**self).cmd()
+    }
+
+    fn data(&self) -> &TLVElement<'_> {
+        (**self).data()
+    }
+}
+
+/// A concrete implementation of the `ReadContext` trait
+pub(crate) struct ReadContextInstance<'a, C> {
+    exchange: &'a Exchange<'a>,
+    context: C,
+    attr: &'a AttrDetails<'a>,
+}
+
+impl<'a, C> ReadContextInstance<'a, C>
+where
+    C: HandlerContext,
+{
+    /// Construct a new instance.
+    #[inline(always)]
+    pub(crate) const fn new(
+        exchange: &'a Exchange<'a>,
+        context: C,
+        attr: &'a AttrDetails<'a>,
+    ) -> Self {
+        Self {
+            exchange,
+            context,
+            attr,
+        }
+    }
+}
+
+impl<C> HandlerContext for ReadContextInstance<'_, C>
+where
+    C: HandlerContext,
+{
+    fn matter(&self) -> &Matter<'_> {
+        self.context.matter()
+    }
+
+    fn crypto(&self) -> impl Crypto + '_ {
+        self.context.crypto()
+    }
+
+    fn kv(&self) -> impl KvBlobStoreAccess + '_ {
+        self.context.kv()
+    }
+
+    fn networks(&self) -> impl NetworksAccess + '_ {
+        self.context.networks()
+    }
+
+    fn handler(&self) -> impl AsyncHandler + '_ {
+        self.context.handler()
+    }
+
+    fn buffers(&self) -> impl BufferAccess<IMBuffer> + '_ {
+        self.context.buffers()
+    }
+}
+
+impl<C> AttrChangeNotifier for ReadContextInstance<'_, C>
+where
+    C: HandlerContext,
+{
+    fn notify_attr_changed(&self, endpoint_id: EndptId, cluster_id: ClusterId, attr_id: AttrId) {
+        self.context
+            .notify_attr_changed(endpoint_id, cluster_id, attr_id);
+    }
+
+    fn notify_cluster_changed(&self, endpoint_id: EndptId, cluster_id: ClusterId) {
+        self.context.notify_cluster_changed(endpoint_id, cluster_id);
+    }
+
+    fn notify_endpoint_changed(&self, endpoint_id: EndptId) {
+        self.context.notify_endpoint_changed(endpoint_id);
+    }
+
+    fn notify_all_changed(&self) {
+        self.context.notify_all_changed();
+    }
+}
+
+impl<C> EventEmitter for ReadContextInstance<'_, C>
+where
+    C: HandlerContext,
+{
+    fn emit_event<F>(
+        &self,
+        endpoint_id: EndptId,
+        cluster_id: ClusterId,
+        event_id: EventId,
+        priority: EventPriority,
+        f: F,
+    ) -> Result<EventNumber, Error>
+    where
+        F: FnOnce(EventTLVWrite<'_>) -> Result<(), Error>,
+    {
+        self.context
+            .emit_event(endpoint_id, cluster_id, event_id, priority, f)
+    }
+}
+
+impl<C> OperationContext for ReadContextInstance<'_, C>
+where
+    C: HandlerContext,
+{
+    fn exchange(&self) -> &Exchange<'_> {
+        self.exchange
+    }
+
+    fn endpt(&self) -> EndptId {
+        self.attr.endpoint_id
+    }
+
+    fn cluster(&self) -> ClusterId {
+        self.attr.cluster_id
+    }
+}
+
+impl<C> OwnAttrChangeNotifier for ReadContextInstance<'_, C>
+where
+    C: HandlerContext,
+{
+    fn notify_own_attr_changed(&self, attr_id: AttrId) {
+        self.notify_attr_changed(self.endpt(), self.cluster(), attr_id);
+    }
+
+    fn notify_own_cluster_changed(&self) {
+        self.notify_cluster_changed(self.endpt(), self.cluster());
+    }
+
+    fn notify_own_endpoint_changed(&self) {
+        self.notify_endpoint_changed(self.endpt());
+    }
+}
+
+impl<C> OwnEventEmitter for ReadContextInstance<'_, C>
+where
+    C: HandlerContext,
+{
+    fn emit_own_event<F>(
+        &self,
+        event_id: EventId,
+        priority: EventPriority,
+        f: F,
+    ) -> Result<EventNumber, Error>
+    where
+        F: FnOnce(EventTLVWrite<'_>) -> Result<(), Error>,
+    {
+        self.context
+            .emit_event(self.endpt(), self.cluster(), event_id, priority, f)
+    }
+}
+
+impl<C> ReadContext for ReadContextInstance<'_, C>
+where
+    C: HandlerContext,
+{
+    fn attr(&self) -> &AttrDetails<'_> {
+        self.attr
+    }
+}
+
+/// A context implementation of the `WriteContext` trait
+pub(crate) struct WriteContextInstance<'a, C> {
+    exchange: &'a Exchange<'a>,
+    context: C,
+    attr: &'a AttrDetails<'a>,
+    data: &'a TLVElement<'a>,
+}
+
+impl<'a, C> WriteContextInstance<'a, C>
+where
+    C: HandlerContext,
+{
+    /// Create a new instance.
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) const fn new(
+        exchange: &'a Exchange<'a>,
+        context: C,
+        attr: &'a AttrDetails<'a>,
+        data: &'a TLVElement<'a>,
+    ) -> Self {
+        Self {
+            exchange,
+            context,
+            attr,
+            data,
+        }
+    }
+}
+
+impl<C> HandlerContext for WriteContextInstance<'_, C>
+where
+    C: HandlerContext,
+{
+    fn matter(&self) -> &Matter<'_> {
+        self.exchange().matter()
+    }
+
+    fn crypto(&self) -> impl Crypto + '_ {
+        self.context.crypto()
+    }
+
+    fn kv(&self) -> impl KvBlobStoreAccess + '_ {
+        self.context.kv()
+    }
+
+    fn networks(&self) -> impl NetworksAccess + '_ {
+        self.context.networks()
+    }
+
+    fn handler(&self) -> impl AsyncHandler + '_ {
+        self.context.handler()
+    }
+
+    fn buffers(&self) -> impl BufferAccess<IMBuffer> + '_ {
+        self.context.buffers()
+    }
+}
+
+impl<C> AttrChangeNotifier for WriteContextInstance<'_, C>
+where
+    C: HandlerContext,
+{
+    fn notify_attr_changed(&self, endpoint_id: EndptId, cluster_id: ClusterId, attr_id: AttrId) {
+        self.context
+            .notify_attr_changed(endpoint_id, cluster_id, attr_id);
+    }
+
+    fn notify_cluster_changed(&self, endpoint_id: EndptId, cluster_id: ClusterId) {
+        self.context.notify_cluster_changed(endpoint_id, cluster_id);
+    }
+
+    fn notify_endpoint_changed(&self, endpoint_id: EndptId) {
+        self.context.notify_endpoint_changed(endpoint_id);
+    }
+
+    fn notify_all_changed(&self) {
+        self.context.notify_all_changed();
+    }
+}
+
+impl<C> EventEmitter for WriteContextInstance<'_, C>
+where
+    C: HandlerContext,
+{
+    fn emit_event<F>(
+        &self,
+        endpoint_id: EndptId,
+        cluster_id: ClusterId,
+        event_id: EventId,
+        priority: EventPriority,
+        f: F,
+    ) -> Result<EventNumber, Error>
+    where
+        F: FnOnce(EventTLVWrite<'_>) -> Result<(), Error>,
+    {
+        self.context
+            .emit_event(endpoint_id, cluster_id, event_id, priority, f)
+    }
+}
+
+impl<C> OperationContext for WriteContextInstance<'_, C>
+where
+    C: HandlerContext,
+{
+    fn exchange(&self) -> &Exchange<'_> {
+        self.exchange
+    }
+
+    fn endpt(&self) -> EndptId {
+        self.attr.endpoint_id
+    }
+
+    fn cluster(&self) -> ClusterId {
+        self.attr.cluster_id
+    }
+}
+
+impl<C> OwnAttrChangeNotifier for WriteContextInstance<'_, C>
+where
+    C: HandlerContext,
+{
+    fn notify_own_attr_changed(&self, attr_id: AttrId) {
+        self.notify_attr_changed(self.endpt(), self.cluster(), attr_id);
+    }
+
+    fn notify_own_cluster_changed(&self) {
+        self.notify_cluster_changed(self.endpt(), self.cluster());
+    }
+
+    fn notify_own_endpoint_changed(&self) {
+        self.notify_endpoint_changed(self.endpt());
+    }
+}
+
+impl<C> OwnEventEmitter for WriteContextInstance<'_, C>
+where
+    C: HandlerContext,
+{
+    fn emit_own_event<F>(
+        &self,
+        event_id: EventId,
+        priority: EventPriority,
+        f: F,
+    ) -> Result<EventNumber, Error>
+    where
+        F: FnOnce(EventTLVWrite<'_>) -> Result<(), Error>,
+    {
+        self.context
+            .emit_event(self.endpt(), self.cluster(), event_id, priority, f)
+    }
+}
+
+impl<C> WriteContext for WriteContextInstance<'_, C>
+where
+    C: HandlerContext,
+{
+    fn attr(&self) -> &AttrDetails<'_> {
+        self.attr
+    }
+
+    fn data(&self) -> &TLVElement<'_> {
+        self.data
+    }
+}
+
+/// A concrete implementation of the `InvokeContext` trait
+pub(crate) struct InvokeContextInstance<'a, C> {
+    exchange: &'a Exchange<'a>,
+    context: C,
+    cmd: &'a CmdDetails<'a>,
+    data: &'a TLVElement<'a>,
+}
+
+impl<'a, C> InvokeContextInstance<'a, C>
+where
+    C: HandlerContext,
+{
+    /// Construct a new instance.
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) const fn new(
+        exchange: &'a Exchange<'a>,
+        context: C,
+        cmd: &'a CmdDetails<'a>,
+        data: &'a TLVElement<'a>,
+    ) -> Self {
+        Self {
+            exchange,
+            context,
+            cmd,
+            data,
+        }
+    }
+}
+
+impl<C> HandlerContext for InvokeContextInstance<'_, C>
+where
+    C: HandlerContext,
+{
+    fn matter(&self) -> &Matter<'_> {
+        self.exchange().matter()
+    }
+
+    fn crypto(&self) -> impl Crypto + '_ {
+        self.context.crypto()
+    }
+
+    fn kv(&self) -> impl KvBlobStoreAccess + '_ {
+        self.context.kv()
+    }
+
+    fn networks(&self) -> impl NetworksAccess + '_ {
+        self.context.networks()
+    }
+
+    fn handler(&self) -> impl AsyncHandler + '_ {
+        self.context.handler()
+    }
+
+    fn buffers(&self) -> impl BufferAccess<IMBuffer> + '_ {
+        self.context.buffers()
+    }
+}
+
+impl<C> AttrChangeNotifier for InvokeContextInstance<'_, C>
+where
+    C: HandlerContext,
+{
+    fn notify_attr_changed(&self, endpoint_id: EndptId, cluster_id: ClusterId, attr_id: AttrId) {
+        self.context
+            .notify_attr_changed(endpoint_id, cluster_id, attr_id);
+    }
+
+    fn notify_cluster_changed(&self, endpoint_id: EndptId, cluster_id: ClusterId) {
+        self.context.notify_cluster_changed(endpoint_id, cluster_id);
+    }
+
+    fn notify_endpoint_changed(&self, endpoint_id: EndptId) {
+        self.context.notify_endpoint_changed(endpoint_id);
+    }
+
+    fn notify_all_changed(&self) {
+        self.context.notify_all_changed();
+    }
+}
+
+impl<C> EventEmitter for InvokeContextInstance<'_, C>
+where
+    C: HandlerContext,
+{
+    fn emit_event<F>(
+        &self,
+        endpoint_id: EndptId,
+        cluster_id: ClusterId,
+        event_id: EventId,
+        priority: EventPriority,
+        f: F,
+    ) -> Result<EventNumber, Error>
+    where
+        F: FnOnce(EventTLVWrite<'_>) -> Result<(), Error>,
+    {
+        self.context
+            .emit_event(endpoint_id, cluster_id, event_id, priority, f)
+    }
+}
+
+impl<C> OperationContext for InvokeContextInstance<'_, C>
+where
+    C: HandlerContext,
+{
+    fn exchange(&self) -> &Exchange<'_> {
+        self.exchange
+    }
+
+    fn endpt(&self) -> EndptId {
+        self.cmd.endpoint_id
+    }
+
+    fn cluster(&self) -> ClusterId {
+        self.cmd.cluster_id
+    }
+}
+
+impl<C> OwnAttrChangeNotifier for InvokeContextInstance<'_, C>
+where
+    C: HandlerContext,
+{
+    fn notify_own_attr_changed(&self, attr_id: AttrId) {
+        self.notify_attr_changed(self.endpt(), self.cluster(), attr_id);
+    }
+
+    fn notify_own_cluster_changed(&self) {
+        self.notify_cluster_changed(self.endpt(), self.cluster());
+    }
+
+    fn notify_own_endpoint_changed(&self) {
+        self.notify_endpoint_changed(self.endpt());
+    }
+}
+
+impl<C> OwnEventEmitter for InvokeContextInstance<'_, C>
+where
+    C: HandlerContext,
+{
+    fn emit_own_event<F>(
+        &self,
+        event_id: EventId,
+        priority: EventPriority,
+        f: F,
+    ) -> Result<EventNumber, Error>
+    where
+        F: FnOnce(EventTLVWrite<'_>) -> Result<(), Error>,
+    {
+        self.context
+            .emit_event(self.endpt(), self.cluster(), event_id, priority, f)
+    }
+}
+
+impl<C> InvokeContext for InvokeContextInstance<'_, C>
+where
+    C: HandlerContext,
+{
+    fn cmd(&self) -> &CmdDetails<'_> {
+        self.cmd
+    }
+
+    fn data(&self) -> &TLVElement<'_> {
+        self.data
+    }
+}
+
+pub trait DataModelHandler: super::AsyncMetadata + AsyncHandler {}
+impl<T> DataModelHandler for T where T: super::AsyncMetadata + AsyncHandler {}
+
+/// A version of the `AsyncHandler` trait that never awaits any operation.
+///
+/// Prefer this trait when implementing handlers that are known to be non-blocking and additionally,
+/// mark those with `NonBlockingHandler`.
+pub trait Handler {
+    /// Read from the requested attribute and encode the result using the provided reply type.
+    fn read(&self, ctx: impl ReadContext, reply: impl ReadReply) -> Result<(), Error>;
+
+    /// Write into the requested attribute using the provided data.
+    fn write(&self, _ctx: impl WriteContext) -> Result<(), Error> {
+        Err(ErrorCode::AttributeNotFound.into())
+    }
+
+    /// Invoke the requested command with the provided data and encode the result using the provided reply type.
+    fn invoke(&self, _ctx: impl InvokeContext, _reply: impl InvokeReply) -> Result<(), Error> {
+        Err(ErrorCode::CommandNotFound.into())
+    }
+
+    /// A hook (a scheduling facility) for placing handler-impl-specific code that needs to run
+    /// asynchronously - forever and in the "background".
+    fn run(&self, _ctx: impl HandlerContext) -> impl Future<Output = Result<(), Error>> {
+        // Default implementation pends forever.
+        // This is useful for handlers that do not need to run any async operations in the background.
+        core::future::pending::<Result<(), Error>>()
+    }
+}
+
+impl<T> Handler for &T
+where
+    T: Handler,
+{
+    fn read(&self, ctx: impl ReadContext, reply: impl ReadReply) -> Result<(), Error> {
+        (**self).read(ctx, reply)
+    }
+
+    fn write(&self, ctx: impl WriteContext) -> Result<(), Error> {
+        (**self).write(ctx)
+    }
+
+    fn invoke(&self, ctx: impl InvokeContext, reply: impl InvokeReply) -> Result<(), Error> {
+        (**self).invoke(ctx, reply)
+    }
+
+    fn run(&self, ctx: impl HandlerContext) -> impl Future<Output = Result<(), Error>> {
+        (**self).run(ctx)
+    }
+}
+
+impl<T> Handler for &mut T
+where
+    T: Handler,
+{
+    fn read(&self, ctx: impl ReadContext, reply: impl ReadReply) -> Result<(), Error> {
+        (**self).read(ctx, reply)
+    }
+
+    fn write(&self, ctx: impl WriteContext) -> Result<(), Error> {
+        (**self).write(ctx)
+    }
+
+    fn invoke(&self, ctx: impl InvokeContext, reply: impl InvokeReply) -> Result<(), Error> {
+        (**self).invoke(ctx, reply)
+    }
+
+    fn run(&self, ctx: impl HandlerContext) -> impl Future<Output = Result<(), Error>> {
+        (**self).run(ctx)
+    }
+}
+
+/// A marker trait that indicates that the handler is non-blocking.
+// TODO: Re-assess the need for this trait.
+pub trait NonBlockingHandler: Handler {}
+
+impl<T> NonBlockingHandler for &T where T: NonBlockingHandler {}
+
+impl<T> NonBlockingHandler for &mut T where T: NonBlockingHandler {}
+
+impl<M, H> Handler for (M, H)
+where
+    H: Handler,
+{
+    fn read(&self, ctx: impl ReadContext, reply: impl ReadReply) -> Result<(), Error> {
+        self.1.read(ctx, reply)
+    }
+
+    fn write(&self, ctx: impl WriteContext) -> Result<(), Error> {
+        self.1.write(ctx)
+    }
+
+    fn invoke(&self, ctx: impl InvokeContext, reply: impl InvokeReply) -> Result<(), Error> {
+        self.1.invoke(ctx, reply)
+    }
+
+    fn run(&self, ctx: impl HandlerContext) -> impl Future<Output = Result<(), Error>> {
+        self.1.run(ctx)
+    }
+}
+
+impl<M, H> NonBlockingHandler for (M, H) where H: NonBlockingHandler {}
+
+/// A trait that defines a matcher for determining whether a handler - member of a handler-chain (`ChainedHandler`)
+/// should be invoked for a specific operation.
+pub trait Matcher {
+    /// Return `true` if the corresponding handler should be invoked for the provided context.
+    fn matches(&self, ctx: impl OperationContext) -> bool;
+}
+
+impl<T> Matcher for &T
+where
+    T: Matcher,
+{
+    fn matches(&self, ctx: impl OperationContext) -> bool {
+        T::matches(self, ctx)
+    }
+}
+
+/// A matcher that matches a specific endpoint ID and cluster ID.
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct EpClMatcher {
+    endpoint_id: Option<EndptId>,
+    cluster_id: Option<ClusterId>,
+}
+
+impl EpClMatcher {
+    /// Create a new `EpClMatcher` instance.
+    ///
+    /// # Arguments:
+    /// - `endpoint_id`: The endpoint ID to match. If `None`, matches any endpoint ID.
+    /// - `cluster_id`: The cluster ID to match. If `None`, matches any cluster ID.
+    pub const fn new(endpoint_id: Option<EndptId>, cluster_id: Option<ClusterId>) -> Self {
+        Self {
+            endpoint_id,
+            cluster_id,
+        }
+    }
+}
+
+impl Matcher for EpClMatcher {
+    fn matches(&self, ctx: impl OperationContext) -> bool {
+        let ctx_endpoint_id = ctx.endpt();
+        let ctx_cluster_id = ctx.cluster();
+
+        self.endpoint_id
+            .map(|endpoint_id| ctx_endpoint_id == endpoint_id)
+            .unwrap_or(true)
+            && self
+                .cluster_id
+                .map(|cluster_id| ctx_cluster_id == cluster_id)
+                .unwrap_or(true)
+    }
+}
+
+/// A handler that always fails with attribute / command not found.
+///
+/// Useful when chaining multiple handlers together as the end of the chain.
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct EmptyHandler;
+
+impl EmptyHandler {
+    /// Chain the empty handler with another handler thus providing an "end of handler chain"
+    /// fallback that errors out.
+    ///
+    /// The returned chained handler works as follows:
+    /// - It will call the provided `handler` instance if the provided matcher returns `true`
+    ///   for the `ReadContext`/`WriteContext`/`InvokeContext` of the incoming operation
+    /// - Otherwise, the empty handler would be invoked, causing the operation to error out.
+    ///
+    /// Arguments:
+    /// - `matcher`: A matcher that determines whether the handler should be invoked for the incoming operation.
+    /// - `handler`: The handler to be invoked if the matcher returns `true`.
+    pub const fn chain<M, H>(self, matcher: M, handler: H) -> ChainedHandler<M, H, Self> {
+        ChainedHandler {
+            matcher,
+            handler,
+            next: self,
+        }
+    }
+}
+
+impl Handler for EmptyHandler {
+    fn read(&self, _ctx: impl ReadContext, _reply: impl ReadReply) -> Result<(), Error> {
+        Err(ErrorCode::AttributeNotFound.into())
+    }
+}
+
+impl NonBlockingHandler for EmptyHandler {}
+
+/// A handler that chains two handlers together in a composite handler.
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct ChainedHandler<M, H, T> {
+    /// The matcher that determines whether the handler should be invoked for the incoming operation.
+    pub matcher: M,
+    /// The handler to be invoked if the matcher returns `true`.
+    pub handler: H,
+    /// The next handler to be invoked if the matcher returns `false`.
+    pub next: T,
+}
+
+impl<M, H, T> ChainedHandler<M, H, T> {
+    /// Construct a chained handler that works as follows:
+    /// - It will call the provided `handler` instance if the provided matcher returns `true`
+    ///   for the `ReadContext`/`WriteContext`/`InvokeContext` of the incoming operation
+    /// - Otherwise, it will call the `next` handler
+    ///
+    /// Arguments:
+    /// - `matcher`: A matcher that determines whether the handler should be invoked for the incoming operation.
+    /// - `handler`: The handler to be invoked if the matcher returns `true`.
+    /// - `next`: The next handler to be invoked if the matcher returns `false`.
+    pub const fn new(matcher: M, handler: H, next: T) -> Self {
+        Self {
+            matcher,
+            handler,
+            next,
+        }
+    }
+
+    /// Chain itself with another handler.
+    ///
+    /// The returned chained handler works as follows:
+    /// - It will call the provided `handler` instance if the provided matcher returns `true`
+    ///   for the `ReadContext`/`WriteContext`/`InvokeContext` of the incoming operation
+    /// - Otherwise, it will call the `self` handler
+    ///
+    /// Arguments:
+    /// - `matcher`: A matcher that determines whether the handler should be invoked for the incoming operation.
+    /// - `handler`: The handler to be invoked if the matcher returns `true`.
+    pub const fn chain<M2, H2>(self, matcher: M2, handler: H2) -> ChainedHandler<M2, H2, Self> {
+        ChainedHandler::new(matcher, handler, self)
+    }
+}
+
+impl<M, H, T> Handler for ChainedHandler<M, H, T>
+where
+    M: Matcher,
+    H: Handler,
+    T: Handler,
+{
+    fn read(&self, ctx: impl ReadContext, reply: impl ReadReply) -> Result<(), Error> {
+        if self.matcher.matches(&ctx) {
+            self.handler.read(ctx, reply)
+        } else {
+            self.next.read(ctx, reply)
+        }
+    }
+
+    fn write(&self, ctx: impl WriteContext) -> Result<(), Error> {
+        if self.matcher.matches(&ctx) {
+            self.handler.write(ctx)
+        } else {
+            self.next.write(ctx)
+        }
+    }
+
+    fn invoke(&self, ctx: impl InvokeContext, reply: impl InvokeReply) -> Result<(), Error> {
+        if self.matcher.matches(&ctx) {
+            self.handler.invoke(ctx, reply)
+        } else {
+            self.next.invoke(ctx, reply)
+        }
+    }
+
+    async fn run(&self, ctx: impl HandlerContext) -> Result<(), Error> {
+        let mut handler = pin!(self.handler.run(&ctx));
+        let mut next = pin!(self.next.run(&ctx));
+
+        select(&mut handler, &mut next).coalesce().await
+    }
+}
+
+impl<M, H, T> NonBlockingHandler for ChainedHandler<M, H, T>
+where
+    M: Matcher,
+    H: NonBlockingHandler,
+    T: NonBlockingHandler,
+{
+}
+
+/// A helper macro that makes it easier to specify the full type of a `ChainedHandler` instantiation,
+/// which can be quite annoying in the case of long chains of handlers.
+///
+/// Use with type aliases:
+/// ```ignore
+/// pub type RootEndpointHandler<'a> = handler_chain_type!(
+///     EpClMatcher => DescriptorCluster<'static>,
+///     EpClMatcher => BasicInfoCluster<'a>,
+///     EpClMatcher => GenCommCluster<'a>,
+///     EpClMatcher => NwCommCluster,
+///     EpClMatcher => AdminCommCluster<'a>,
+///     EpClMatcher => NocCluster<'a>,
+///     EpClMatcher => AccessControlCluster<'a>,
+///     EpClMatcher => GenDiagCluster,
+///     EpClMatcher => EthNwDiagCluster,
+///     EpClMatcher => GrpKeyMgmtCluster
+/// );
+/// ```
+#[allow(unused_macros)]
+#[macro_export]
+macro_rules! handler_chain_type {
+    ($m:ty => $h:ty) => {
+        $crate::dm::ChainedHandler<$m, $h, $crate::dm::EmptyHandler>
+    };
+    ($m1:ty => $h1:ty, $($m:ty => $h:ty),+) => {
+        $crate::dm::ChainedHandler<$m1, $h1, handler_chain_type!($($m => $h),+)>
+    };
+    ($m:ty => $h:ty | $f:ty) => {
+        $crate::dm::ChainedHandler<$m, $h, $f>
+    };
+    ($m1:ty => $h1:ty, $($m:ty => $h:ty),+ | $f:ty) => {
+        $crate::dm::ChainedHandler<$m1, $h1, handler_chain_type!($($m => $h),+ | $f)>
+    };
+}
+
+mod asynch {
+    use core::future::Future;
+    use core::pin::pin;
+
+    use either::Either;
+    use embassy_futures::select::select;
+
+    use crate::dm::{HandlerContext, InvokeReply, Matcher, ReadReply};
+    use crate::error::{Error, ErrorCode};
+    use crate::utils::future::delayed_ready;
+    use crate::utils::select::Coalesce;
+
+    use super::{
+        ChainedHandler, EmptyHandler, Handler, InvokeContext, NonBlockingHandler, ReadContext,
+        WriteContext,
+    };
+
+    /// A handler for processing a single IM operation:
+    /// read an attribute, write an attribute, or invoke a command.
+    ///
+    /// Handlers are typically implemented by user-defined clusters, but there is no 1:1 correspondence between
+    /// a handler and a cluster, as a single handler can handle multiple clusters and even multiple endpoints.
+    ///
+    /// Moreover, the `DataModel` implementation expects a single `AsyncHandler` instance, so the expectation
+    /// is that the user will compose multiple handlers into a single `AsyncHandler` instance, using `ChainedHandler`
+    /// or other means.
+    pub trait AsyncHandler {
+        /// Provide information whether the handler will internally await while reading
+        /// the current value of the provided attribute.
+        ///
+        /// Handlers which report `false` via this method provide an opportunity
+        /// for the Data Model processing to use less memory by not storing the incoming request
+        /// in an intermediate buffer.
+        ///
+        /// The default implementation unconditionally returns `true` i.e. the handler is assumed to
+        /// await while reading any attribute.
+        fn read_awaits(&self, _ctx: impl ReadContext) -> bool {
+            true
+        }
+
+        /// Provide information whether the handler will internally await while updating
+        /// the value of the provided attribute.
+        ///
+        /// Handlers which report `false` via this method provide an opportunity
+        /// for the Data Model processing to use less memory by not storing the incoming request
+        /// in an intermediate buffer.
+        ///
+        /// The default implementation unconditionally returns `true` i.e. the handler is assumed to
+        /// await while writing any attribute.
+        fn write_awaits(&self, _ctx: impl WriteContext) -> bool {
+            true
+        }
+
+        /// Provide information whether the handler will internally await while invoking
+        /// the provided command.
+        ///
+        /// Handlers which report `false` via this method provide an opportunity
+        /// for the Data Model processing to use less memory by not storing the incoming request
+        /// in an intermediate buffer.
+        ///
+        /// The default implementation unconditionally returns `true` i.e. the handler is assumed to
+        /// await while invoking any command.
+        fn invoke_awaits(&self, _ctx: impl InvokeContext) -> bool {
+            true
+        }
+
+        /// Read from the requested attribute and encode the result using the provided reply type.
+        fn read(
+            &self,
+            ctx: impl ReadContext,
+            reply: impl ReadReply,
+        ) -> impl Future<Output = Result<(), Error>>;
+
+        /// Write into the requested attribute using the provided data.
+        ///
+        /// The default implementation errors out with `ErrorCode::AttributeNotFound`.
+        fn write(&self, _ctx: impl WriteContext) -> impl Future<Output = Result<(), Error>> {
+            core::future::ready(Err(ErrorCode::AttributeNotFound.into()))
+        }
+
+        /// Invoke the requested command with the provided data and encode the result using the provided reply type.
+        ///
+        /// The default implementation errors out with `ErrorCode::CommandNotFound`.
+        fn invoke(
+            &self,
+            _ctx: impl InvokeContext,
+            _reply: impl InvokeReply,
+        ) -> impl Future<Output = Result<(), Error>> {
+            core::future::ready(Err(ErrorCode::CommandNotFound.into()))
+        }
+
+        /// A hook (a scheduling facility) for placing handler-impl-specific code that needs to run
+        /// asynchronously - forever and in the "background".
+        fn run(&self, _ctx: impl HandlerContext) -> impl Future<Output = Result<(), Error>> {
+            // Default implementation pends forever.
+            // This is useful for handlers that do not need to run any async operations in the background.
+            core::future::pending::<Result<(), Error>>()
+        }
+    }
+
+    impl<T> AsyncHandler for &mut T
+    where
+        T: AsyncHandler,
+    {
+        fn read_awaits(&self, ctx: impl ReadContext) -> bool {
+            (**self).read_awaits(ctx)
+        }
+
+        fn write_awaits(&self, ctx: impl WriteContext) -> bool {
+            (**self).write_awaits(ctx)
+        }
+
+        fn invoke_awaits(&self, ctx: impl InvokeContext) -> bool {
+            (**self).invoke_awaits(ctx)
+        }
+
+        fn read(
+            &self,
+            ctx: impl ReadContext,
+            reply: impl ReadReply,
+        ) -> impl Future<Output = Result<(), Error>> {
+            (**self).read(ctx, reply)
+        }
+
+        fn write(&self, ctx: impl WriteContext) -> impl Future<Output = Result<(), Error>> {
+            (**self).write(ctx)
+        }
+
+        fn invoke(
+            &self,
+            ctx: impl InvokeContext,
+            reply: impl InvokeReply,
+        ) -> impl Future<Output = Result<(), Error>> {
+            (**self).invoke(ctx, reply)
+        }
+
+        fn run(&self, ctx: impl HandlerContext) -> impl Future<Output = Result<(), Error>> {
+            (**self).run(ctx)
+        }
+    }
+
+    impl<T> AsyncHandler for &T
+    where
+        T: AsyncHandler,
+    {
+        fn read_awaits(&self, ctx: impl ReadContext) -> bool {
+            (**self).read_awaits(ctx)
+        }
+
+        fn write_awaits(&self, ctx: impl WriteContext) -> bool {
+            (**self).write_awaits(ctx)
+        }
+
+        fn invoke_awaits(&self, ctx: impl InvokeContext) -> bool {
+            (**self).invoke_awaits(ctx)
+        }
+
+        fn read(
+            &self,
+            ctx: impl ReadContext,
+            reply: impl ReadReply,
+        ) -> impl Future<Output = Result<(), Error>> {
+            (**self).read(ctx, reply)
+        }
+
+        fn write(&self, ctx: impl WriteContext) -> impl Future<Output = Result<(), Error>> {
+            (**self).write(ctx)
+        }
+
+        fn invoke(
+            &self,
+            ctx: impl InvokeContext,
+            reply: impl InvokeReply,
+        ) -> impl Future<Output = Result<(), Error>> {
+            (**self).invoke(ctx, reply)
+        }
+
+        fn run(&self, ctx: impl HandlerContext) -> impl Future<Output = Result<(), Error>> {
+            (**self).run(ctx)
+        }
+    }
+
+    impl<M, H> AsyncHandler for (M, H)
+    where
+        H: AsyncHandler,
+    {
+        fn read_awaits(&self, ctx: impl ReadContext) -> bool {
+            self.1.read_awaits(ctx)
+        }
+
+        fn write_awaits(&self, ctx: impl WriteContext) -> bool {
+            self.1.write_awaits(ctx)
+        }
+
+        fn invoke_awaits(&self, ctx: impl InvokeContext) -> bool {
+            self.1.invoke_awaits(ctx)
+        }
+
+        fn read(
+            &self,
+            ctx: impl ReadContext,
+            reply: impl ReadReply,
+        ) -> impl Future<Output = Result<(), Error>> {
+            self.1.read(ctx, reply)
+        }
+
+        fn write(&self, ctx: impl WriteContext) -> impl Future<Output = Result<(), Error>> {
+            self.1.write(ctx)
+        }
+
+        fn invoke(
+            &self,
+            ctx: impl InvokeContext,
+            reply: impl InvokeReply,
+        ) -> impl Future<Output = Result<(), Error>> {
+            self.1.invoke(ctx, reply)
+        }
+
+        fn run(&self, ctx: impl HandlerContext) -> impl Future<Output = Result<(), Error>> {
+            self.1.run(ctx)
+        }
+    }
+
+    impl<T> AsyncHandler for Async<T>
+    where
+        T: NonBlockingHandler,
+    {
+        fn read_awaits(&self, _ctx: impl ReadContext) -> bool {
+            false
+        }
+
+        fn write_awaits(&self, _ctx: impl WriteContext) -> bool {
+            false
+        }
+
+        fn invoke_awaits(&self, _ctx: impl InvokeContext) -> bool {
+            false
+        }
+
+        fn read(
+            &self,
+            ctx: impl ReadContext,
+            reply: impl ReadReply,
+        ) -> impl Future<Output = Result<(), Error>> {
+            delayed_ready(|| Handler::read(&self.0, ctx, reply))
+        }
+
+        fn write(&self, ctx: impl WriteContext) -> impl Future<Output = Result<(), Error>> {
+            delayed_ready(|| Handler::write(&self.0, ctx))
+        }
+
+        fn invoke(
+            &self,
+            ctx: impl InvokeContext,
+            reply: impl InvokeReply,
+        ) -> impl Future<Output = Result<(), Error>> {
+            delayed_ready(|| Handler::invoke(&self.0, ctx, reply))
+        }
+
+        fn run(&self, ctx: impl HandlerContext) -> impl Future<Output = Result<(), Error>> {
+            Handler::run(&self.0, ctx)
+        }
+    }
+
+    impl AsyncHandler for EmptyHandler {
+        fn read_awaits(&self, _ctx: impl ReadContext) -> bool {
+            false
+        }
+
+        fn write_awaits(&self, _ctx: impl WriteContext) -> bool {
+            false
+        }
+
+        fn invoke_awaits(&self, _ctx: impl InvokeContext) -> bool {
+            false
+        }
+
+        fn read(
+            &self,
+            _ctx: impl ReadContext,
+            _reply: impl ReadReply,
+        ) -> impl Future<Output = Result<(), Error>> {
+            core::future::ready(Err(ErrorCode::AttributeNotFound.into()))
+        }
+    }
+
+    impl<M, H, T> AsyncHandler for ChainedHandler<M, H, T>
+    where
+        M: Matcher,
+        H: AsyncHandler,
+        T: AsyncHandler,
+    {
+        fn read_awaits(&self, ctx: impl ReadContext) -> bool {
+            if self.matcher.matches(&ctx) {
+                self.handler.read_awaits(ctx)
+            } else {
+                self.next.read_awaits(ctx)
+            }
+        }
+
+        fn write_awaits(&self, ctx: impl WriteContext) -> bool {
+            if self.matcher.matches(&ctx) {
+                self.handler.write_awaits(ctx)
+            } else {
+                self.next.write_awaits(ctx)
+            }
+        }
+
+        fn invoke_awaits(&self, ctx: impl InvokeContext) -> bool {
+            if self.matcher.matches(&ctx) {
+                self.handler.invoke_awaits(ctx)
+            } else {
+                self.next.invoke_awaits(ctx)
+            }
+        }
+
+        fn read(
+            &self,
+            ctx: impl ReadContext,
+            reply: impl ReadReply,
+        ) -> impl Future<Output = Result<(), Error>> {
+            if self.matcher.matches(&ctx) {
+                Either::Left(self.handler.read(ctx, reply))
+            } else {
+                Either::Right(self.next.read(ctx, reply))
+            }
+        }
+
+        fn write(&self, ctx: impl WriteContext) -> impl Future<Output = Result<(), Error>> {
+            if self.matcher.matches(&ctx) {
+                Either::Left(self.handler.write(ctx))
+            } else {
+                Either::Right(self.next.write(ctx))
+            }
+        }
+
+        fn invoke(
+            &self,
+            ctx: impl InvokeContext,
+            reply: impl InvokeReply,
+        ) -> impl Future<Output = Result<(), Error>> {
+            if self.matcher.matches(&ctx) {
+                Either::Left(self.handler.invoke(ctx, reply))
+            } else {
+                Either::Right(self.next.invoke(ctx, reply))
+            }
+        }
+
+        async fn run(&self, ctx: impl HandlerContext) -> Result<(), Error> {
+            let mut handler = pin!(self.handler.run(&ctx));
+            let mut next = pin!(self.next.run(&ctx));
+
+            select(&mut handler, &mut next).coalesce().await
+        }
+    }
+
+    /// An adaptor that adapts a `NonBlockingHandler` trait implementation to the `AsyncHandler` trait contract.
+    ///
+    /// The adaptor also implements `NonBlockingHandler` so that the adapted handler can be used in any context.
+    #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
+    #[cfg_attr(feature = "defmt", derive(defmt::Format))]
+    pub struct Async<T>(pub T);
+
+    impl<T> Handler for Async<T>
+    where
+        T: Handler,
+    {
+        fn read(&self, ctx: impl ReadContext, reply: impl ReadReply) -> Result<(), Error> {
+            self.0.read(ctx, reply)
+        }
+
+        fn write(&self, ctx: impl WriteContext) -> Result<(), Error> {
+            self.0.write(ctx)
+        }
+
+        fn invoke(&self, ctx: impl InvokeContext, reply: impl InvokeReply) -> Result<(), Error> {
+            self.0.invoke(ctx, reply)
+        }
+
+        fn run(&self, ctx: impl HandlerContext) -> impl Future<Output = Result<(), Error>> {
+            self.0.run(ctx)
+        }
+    }
+
+    impl<T> NonBlockingHandler for Async<T> where T: NonBlockingHandler {}
+}

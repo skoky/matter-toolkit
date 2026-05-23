@@ -15,6 +15,9 @@ serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 toml = "0.8"
 
+[patch.crates-io]
+matc = { path = "../matc-patched" }
+
 
 [[bin]]
 path = "src/main.rs"
