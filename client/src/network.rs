@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use flume::RecvTimeoutError;
-use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
+use mdns_sd::{ResolvedService, ServiceDaemon, ServiceEvent};
 use std::{
     collections::BTreeMap,
     time::{Duration, Instant},
@@ -27,7 +27,7 @@ pub fn scan_network(
     Ok((commissionable, commissioned))
 }
 
-fn browse_devices(service_type: &str, timeout: Duration) -> Result<Vec<ServiceInfo>> {
+fn browse_devices(service_type: &str, timeout: Duration) -> Result<Vec<ResolvedService>> {
     let mdns = ServiceDaemon::new().context("failed to create mDNS daemon")?;
     let receiver = mdns
         .browse(service_type)
@@ -40,7 +40,7 @@ fn browse_devices(service_type: &str, timeout: Duration) -> Result<Vec<ServiceIn
         let wait_time = remaining.min(Duration::from_millis(250));
         match receiver.recv_timeout(wait_time) {
             Ok(ServiceEvent::ServiceResolved(info)) => {
-                devices.insert(info.get_fullname().to_string(), info);
+                devices.insert(info.get_fullname().to_string(), *info);
             }
             Ok(ServiceEvent::ServiceRemoved(_, fullname)) => {
                 devices.remove(&fullname);
@@ -55,7 +55,7 @@ fn browse_devices(service_type: &str, timeout: Duration) -> Result<Vec<ServiceIn
     Ok(devices.into_values().collect())
 }
 
-fn to_commissionable_device(info: ServiceInfo) -> CommissionableDevice {
+fn to_commissionable_device(info: ResolvedService) -> CommissionableDevice {
     let display_name = info
         .get_property_val_str("DN")
         .map(str::to_string)
@@ -69,7 +69,7 @@ fn to_commissionable_device(info: ServiceInfo) -> CommissionableDevice {
     CommissionableDevice {
         display_name,
         device_type,
-        addresses: sort_ips(info.get_addresses().iter().copied().collect()),
+        addresses: sort_ips(info.get_addresses().iter().map(|ip| ip.to_ip_addr()).collect()),
         port: info.get_port(),
         discriminator: info.get_property_val_str("D").map(str::to_string),
         vendor_id,
@@ -77,9 +77,9 @@ fn to_commissionable_device(info: ServiceInfo) -> CommissionableDevice {
     }
 }
 
-fn to_commissioned_device(info: ServiceInfo, state: &AppState) -> CommissionedDevice {
+fn to_commissioned_device(info: ResolvedService, state: &AppState) -> CommissionedDevice {
     let address = first_socket_addr(
-        &sort_ips(info.get_addresses().iter().copied().collect()),
+        &sort_ips(info.get_addresses().iter().map(|ip| ip.to_ip_addr()).collect()),
         info.get_port(),
     );
     let known = state
@@ -90,7 +90,7 @@ fn to_commissioned_device(info: ServiceInfo, state: &AppState) -> CommissionedDe
 
     CommissionedDevice {
         display_name: trim_service_name(info.get_fullname()),
-        addresses: sort_ips(info.get_addresses().iter().copied().collect()),
+        addresses: sort_ips(info.get_addresses().iter().map(|ip| ip.to_ip_addr()).collect()),
         port: info.get_port(),
         known,
     }
