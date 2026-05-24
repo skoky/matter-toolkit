@@ -25,7 +25,6 @@ use rs_matter::dm::{
 };
 use rs_matter::error::{Error, ErrorCode};
 use rs_matter::pairing::DiscoveryCapabilities;
-use rs_matter::pairing::qr::QrTextType;
 use rs_matter::persist::{DirKvBlobStore, SharedKvBlobStore};
 use rs_matter::respond::DefaultResponder;
 use rs_matter::sc::pase::MAX_COMM_WINDOW_TIMEOUT_SECS;
@@ -37,6 +36,7 @@ use rs_matter::{MATTER_PORT, Matter, clusters, devices, with};
 pub use rs_matter::dm::clusters::decl::bridged_device_basic_information::{
     self, ClusterHandler as _, KeepActiveRequest,
 };
+use rs_matter::pairing::qr::QrTextType;
 
 mod light_on_off;
 mod mdns;
@@ -95,6 +95,7 @@ pub async fn run_bridge() -> Result<(), Error> {
         if !matter.is_commissioned() {
             matter.print_standard_qr_text(DiscoveryCapabilities::IP)?;
             matter.print_standard_qr_code(QrTextType::Unicode, DiscoveryCapabilities::IP)?;
+            save_pairing_files(&matter, DiscoveryCapabilities::IP);
             matter.open_basic_comm_window(
                 MAX_COMM_WINDOW_TIMEOUT_SECS,
                 &crypto,
@@ -131,6 +132,7 @@ pub async fn run_bridge() -> Result<(), Error> {
         if !matter.is_commissioned() {
             matter.print_standard_qr_text(DiscoveryCapabilities::IP)?;
             matter.print_standard_qr_code(QrTextType::Unicode, DiscoveryCapabilities::IP)?;
+            save_pairing_files(&matter, DiscoveryCapabilities::IP);
             matter.open_basic_comm_window(
                 MAX_COMM_WINDOW_TIMEOUT_SECS,
                 &crypto,
@@ -145,6 +147,73 @@ pub async fn run_bridge() -> Result<(), Error> {
             result = &mut dm_job => result,
         }
     }
+}
+
+fn save_pairing_files(matter: &Matter, _disc_caps: DiscoveryCapabilities) {
+    let pairing_code = matter.dev_comm().compute_pretty_pairing_code();
+    // https://project-chip.github.io/connectedhomeip/qrcode.html?data=MT%3A-24J042C000GM363000
+
+    // let payload = match standard_qr_payload(matter, disc_caps) {
+    //     Ok(p) => p,
+    //     Err(e) => {
+    //         log::error!("Failed to get QR payload: {:?}", e);
+    //         return;
+    //     }
+    // };
+    //
+    // let mut buf = vec![0u8; 2048];
+    // let (qr_text, _) = match payload.as_str(&mut buf) {
+    //     Ok(r) => r,
+    //     Err(e) => {
+    //         log::error!("Failed to encode QR text: {:?}", e);
+    //         return;
+    //     }
+    // };
+    // let qr_text_owned = qr_text.to_string();
+
+    // let content = format!("Pairing Code: {}\nQR Code URL: https://project-chip.github.io/connectedhomeip/qrcode.html?data={}\n", pairing_code, qr_text_owned);
+    let content = format!("Pairing Code: {}", pairing_code);
+    if let Err(e) = std::fs::write("pairing_code.txt", &content) {
+        log::error!("Failed to save pairing_code.txt: {}", e);
+    } else {
+        log::info!("Pairing code saved to pairing_code.txt");
+    }
+
+    // let mut qr_buf = vec![0u8; 8192];
+    // let mid = qr_buf.len() / 2;
+    // let (tmp_buf, out_buf) = qr_buf.split_at_mut(mid);
+    // let qr = match Qr::compute(&qr_text_owned, tmp_buf, out_buf) {
+    //     Ok(q) => q,
+    //     Err(e) => {
+    //         log::error!("Failed to compute QR code: {:?}", e);
+    //         return;
+    //     }
+    // };
+    //
+    // let size = qr.size();
+    // let scale = 10u32;
+    // let border = 4u32;
+    // let img_size = (size + 2 * border) * scale;
+    // let mut img = image::GrayImage::new(img_size, img_size);
+    //
+    // for py in 0..img_size {
+    //     for px in 0..img_size {
+    //         let mx = (px / scale) as i32 - border as i32;
+    //         let my = (py / scale) as i32 - border as i32;
+    //         let is_dark = mx >= 0
+    //             && my >= 0
+    //             && mx < size as i32
+    //             && my < size as i32
+    //             && qr.get_module(mx, my);
+    //         img.put_pixel(px, py, image::Luma([if is_dark { 0u8 } else { 255u8 }]));
+    //     }
+    // }
+
+    // if let Err(e) = img.save("pairing_qr.png") {
+    //     log::error!("Failed to save pairing_qr.png: {}", e);
+    // } else {
+    //     log::info!("QR code image saved to pairing_qr.png");
+    // }
 }
 
 fn second_light_enabled() -> bool {

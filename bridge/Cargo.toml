@@ -10,6 +10,7 @@ env_logger = "0.11"
 if-addrs = "0.15"
 log = "0.4"
 rand = { version = "0.8", features = ["std", "std_rng"] }
-rs-matter = { git = "https://github.com/project-chip/rs-matter", rev = "ab5fbec10a86b0ed845e763181b4ddf5511510ca", features = ["async-io", "max-groups-per-fabric-12", "max-group-keys-per-fabric-2", "max-group-endpoints-per-fabric-3"] }
+rs-matter = { git = "https://github.com/skoky/rs-matter", branch = "subst_fix_older_version", features = ["async-io", "max-groups-per-fabric-12", "max-group-keys-per-fabric-2", "max-group-endpoints-per-fabric-3"] }
 socket2 = { version = "0.5", features = ["all"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+#image = { version = "0.25", default-features = false, features = ["png"] }
