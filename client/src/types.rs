@@ -1,4 +1,5 @@
 use std::net::IpAddr;
+use std::time::Instant;
 use matc::{clusters::codec, controller};
 use crate::state::KnownDevice;
 
@@ -27,6 +28,7 @@ pub struct EndpointSummary {
     pub label: Option<String>,
     pub device_types: Vec<String>,
     pub has_on_off: bool,
+    pub on_off_state: Option<bool>,
     pub actions: Vec<codec::actions_cluster::Action>,
 }
 
@@ -35,6 +37,7 @@ pub struct ManageState {
     pub connection: controller::Connection,
     pub endpoints: Vec<EndpointSummary>,
     pub selected_endpoint: usize,
+    pub last_endpoint_refresh: Instant,
 }
 
 pub struct PendingCommission {
@@ -137,6 +140,7 @@ pub enum PendingTask {
     },
     Decommission,
     FinishCommission(PendingCommission),
+    RefreshEndpoints,
 }
 
 /// Drives the color of the status bar in the UI.

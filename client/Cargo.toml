@@ -9,7 +9,7 @@ env_logger = "0.11"
 crossterm = "0.29"
 flume = "0.11"
 mdns-sd = "0.19"
-matc = { git = "https://github.com/skoky/rust-matc.git", branch = "arm_failsafe_fix" }
+matc = { git = "https://github.com/skoky/rust-matc.git" }
 ratatui = "0.30"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }

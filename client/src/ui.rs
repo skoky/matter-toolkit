@@ -250,7 +250,12 @@ fn render_endpoint_list(frame: &mut Frame<'_>, manage: &ManageState, area: Rect)
 fn endpoint_capability_spans(ep: &EndpointSummary) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
     if ep.has_on_off {
-        spans.push(Span::styled("[on/off]", Style::new().fg(Color::Yellow).dim()));
+        let (label, style) = match ep.on_off_state {
+            Some(true) => ("● On ", Style::new().fg(Color::Green).bold()),
+            Some(false) => ("● Off", Style::new().fg(Color::DarkGray)),
+            None => ("○ on/off", Style::new().fg(Color::Yellow).dim()),
+        };
+        spans.push(Span::styled(label, style));
         spans.push(Span::raw(" "));
     }
     if !ep.actions.is_empty() {
@@ -303,11 +308,17 @@ fn selected_endpoint_text(manage: &ManageState) -> Text<'static> {
         Line::from(vec![
             Span::styled("OnOff:     ", Style::new().dim()),
             Span::styled(
-                if ep.has_on_off { "yes" } else { "no" },
-                if ep.has_on_off {
-                    Style::new().fg(Color::Yellow)
-                } else {
-                    Style::new().dim()
+                match ep.on_off_state {
+                    Some(true) => "On",
+                    Some(false) => "Off",
+                    None if ep.has_on_off => "unknown",
+                    None => "no",
+                },
+                match ep.on_off_state {
+                    Some(true) => Style::new().fg(Color::Green).bold(),
+                    Some(false) => Style::new().fg(Color::DarkGray),
+                    None if ep.has_on_off => Style::new().fg(Color::Yellow).dim(),
+                    None => Style::new().dim(),
                 },
             ),
         ]),
@@ -335,7 +346,7 @@ fn manage_footer(app: &App) -> Paragraph<'static> {
     Paragraph::new(vec![
         Line::from(Span::styled(app.status.clone(), status_style(app.status_kind))),
         Line::from(Span::styled(
-            "↑↓ select  o on  p off  a actions  n rename  f fabric  d decommission  b/Esc back",
+            "↑↓ select  o on  p off  r refresh  a actions  n rename  f fabric  d decommission  b/Esc back",
             Style::new().dim(),
         )),
     ])

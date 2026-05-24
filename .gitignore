@@ -7,3 +7,5 @@ bridge/.matter_kvs
 /client/*.log
 /client/client-state.toml
 
+/bridge/pairing_code.txt
+/client/serverlog.txt

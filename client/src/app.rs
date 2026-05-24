@@ -18,6 +18,8 @@ use crate::utils::{
 
 pub const STATE_PATH: &str = "./client-state.toml";
 
+const AUTO_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
 pub struct App {
     pub state: AppState,
     pub screen: Screen,
@@ -242,6 +244,9 @@ impl App {
                     confirm: ConfirmAction::Decommission,
                 }));
             }
+            KeyCode::Char('r') => {
+                self.queue_task(PendingTask::RefreshEndpoints, "Refreshing endpoints...");
+            }
             _ => {}
         }
         Ok(())
@@ -425,6 +430,7 @@ impl App {
                         node_id: manage.device.node_id,
                         endpoint_id: ep.id,
                         label: dialog.value.trim().to_string(),
+                        device_types: ep.device_types.clone(),
                     },
                 );
                 self.state.save(STATE_PATH)?;
@@ -589,9 +595,37 @@ impl App {
             PendingTask::FinishCommission(pending) => {
                 self.finish_commission(pending).await?;
             }
+            PendingTask::RefreshEndpoints => {
+                let Screen::Manage(manage) = &mut self.screen else {
+                    return Ok(());
+                };
+                let node_id = manage.device.node_id;
+                let mut endpoints = matter::load_endpoints(&mut manage.connection).await?;
+                apply_endpoint_aliases(&self.state, node_id, &mut endpoints);
+                manage.selected_endpoint =
+                    clamp_selection(manage.selected_endpoint, endpoints.len());
+                manage.endpoints = endpoints;
+                manage.last_endpoint_refresh = std::time::Instant::now();
+                self.status = "Endpoints refreshed.".to_string();
+                self.status_kind = StatusKind::Success;
+            }
         }
 
         Ok(())
+    }
+
+    pub fn check_auto_refresh(&mut self) {
+        if self.pending_task.is_some() || self.modal.is_some() {
+            return;
+        }
+        let Screen::Manage(manage) = &self.screen else {
+            return;
+        };
+        if manage.last_endpoint_refresh.elapsed() >= AUTO_REFRESH_INTERVAL {
+            self.pending_task = Some(PendingTask::RefreshEndpoints);
+            self.status = "Auto-refreshing endpoints...".to_string();
+            self.status_kind = StatusKind::Progress;
+        }
     }
 
     async fn open_selected_commissioned(&mut self) -> Result<()> {
@@ -623,8 +657,9 @@ impl App {
             connection,
             endpoints,
             selected_endpoint: 0,
+            last_endpoint_refresh: std::time::Instant::now(),
         });
-        self.status = "Connected.  o on  p off  a actions  n rename  f fabric  d decommission  b back".to_string();
+        self.status = "Connected.  o on  p off  r refresh  a actions  n rename  f fabric  d decommission  b back".to_string();
         self.status_kind = StatusKind::Success;
         Ok(())
     }
@@ -652,6 +687,7 @@ impl App {
                     node_id: pending.node_id,
                     endpoint_id: ep.id,
                     label,
+                    device_types: ep.device_types.clone(),
                 },
             );
         }
