@@ -25,6 +25,8 @@ pub struct EndpointAlias {
     pub node_id: u64,
     pub endpoint_id: u16,
     pub label: String,
+    #[serde(default)]
+    pub device_types: Vec<String>,
 }
 
 impl Default for AppState {

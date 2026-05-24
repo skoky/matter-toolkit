@@ -178,6 +178,18 @@ async fn load_endpoint_summary(
         .collect();
 
     let label = detect_device_label(connection, endpoint_id).await;
+
+    let has_on_off = clusters.contains(&defs::CLUSTER_ID_ON_OFF);
+    let on_off_state = if has_on_off {
+        connection
+            .read_request2(endpoint_id, defs::CLUSTER_ID_ON_OFF, defs::CLUSTER_ON_OFF_ATTR_ID_ONOFF)
+            .await
+            .ok()
+            .and_then(|v| if let matc::tlv::TlvItemValue::Bool(b) = v { Some(b) } else { None })
+    } else {
+        None
+    };
+
     let actions = if clusters.contains(&defs::CLUSTER_ID_ACTIONS) {
         let tlv = connection
             .read_request2(
@@ -195,7 +207,8 @@ async fn load_endpoint_summary(
         id: endpoint_id,
         label,
         device_types,
-        has_on_off: clusters.contains(&defs::CLUSTER_ID_ON_OFF),
+        has_on_off,
+        on_off_state,
         actions,
     })
 }

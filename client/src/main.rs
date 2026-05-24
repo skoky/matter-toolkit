@@ -59,6 +59,8 @@ async fn run_app(
             continue;
         }
 
+        app.check_auto_refresh();
+
         if event::poll(Duration::from_millis(200))? {
             if let Event::Key(key) = event::read()? {
                 if let Err(err) = app.on_key(key).await {
